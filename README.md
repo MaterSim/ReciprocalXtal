@@ -11,15 +11,13 @@ It contains scripts used to generate the  figures and demonstrations in the manu
 ```
 .
 ├── reciprocal.py        # Core routines for reciprocal-space representation and P_nl computation
-├── rdf_real.py          # Real-space RDF utilities (baseline comparison)
+├── rdf_real.py          # Real-space RDF Calculation
 ├── README.md
 ├── Fig-4_Pnl_calc/
 │   ├── compute_and_plot__Pnl.py   # Computes and visualizes the power spectrum P_nl
-│   └── p-demo.png
 ├── Fig-5_noise_stability/
 │   ├── plot_diamond_noise_robustness.py   # Noise-robustness test (diamond)
-│   └── test1-diamond.png
-└── Fig-6_reconstruction/
+└── Fig-6_reconstruction/                   # Reconstruct from noisy structure
     ├── diamond/
     └── quartz/
 ```
