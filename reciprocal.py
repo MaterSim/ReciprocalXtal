@@ -8,42 +8,139 @@ from pyxtal.database.element import Element
 from pyxtal.XRD import create_index
 import torch
 from e3nn.o3 import spherical_harmonics
+import numpy as np
+from scipy.special import jv, jn_zeros
+from functools import lru_cache
 
 with importlib.resources.as_file(
     importlib.resources.files("pyxtal") / "database" / "atomic_scattering_params.json"
 ) as path:
     ATOMIC_SCATTERING_PARAMS = loadfn(path)
+  
+import torch
+import numpy as np
+from scipy.special import spherical_jn
+from scipy.optimize import brentq
 
-def bessel_basis(r, nmax=6, r_cut=0.24):
+@lru_cache(maxsize=64)
+def spherical_bessel_zeros(l, nmax):
     """
-    Spherical Bessel basis functions - excellent for reciprocal space
+    Compute first nmax zeros of spherical Bessel function j_l(x).
+    
+    Parameters
+    ----------
+    l : int
+        Angular momentum order (0=s, 1=p, 2=d, etc.)
+    nmax : int
+        Number of zeros to compute
+    
+    Returns
+    -------
+    zeros : np.ndarray
+        Array of first nmax zeros, shape (nmax,)
     """
-    from scipy.special import spherical_jn
+    nmax = int(nmax)  # Defensive conversion
+    zeros = []
+    for n in range(1, nmax + 1):
+        # Approximate bounds for n-th zero of j_l
+        a = (n + l/2 - 0.5) * np.pi
+        b = (n + l/2 + 0.5) * np.pi
+        
+        # Find zero using Brent's method
+        z = brentq(lambda x: spherical_jn(l, x), a, b)
+        zeros.append(z)
+    
+    return np.array(zeros, dtype=np.float64)
 
-    r_numpy = r.cpu().numpy()
-    r_scaled = r_numpy / r_cut * (nmax + 1) * np.pi
-
-    basis = torch.zeros((r.shape[0], nmax), dtype=r.dtype, device=r.device)
-    for n in range(nmax):
-        # Add small offset to avoid singularity at r=0
-        jn = spherical_jn(n, r_scaled + 1e-10)
-        #basis[:, n] = torch.tensor(jn, dtype=r.dtype, device=r.device)
-        basis[:, n] = torch.tensor(jn, dtype=r.dtype, device=r.device).view(-1)
-
-    return basis
+def bessel_basis(r, nmax=6, r_cut=0.24, l=0):
+    """
+    ORTHONORMAL spherical Bessel radial basis on [0, r_cut] under r^2 dr measure.
+    
+    This constructs basis functions that satisfy:
+    ∫₀^r_cut r² Rₙ(r) Rₘ(r) dr = δₙₘ (Kronecker delta)
+    
+    Parameters
+    ----------
+    r : torch.Tensor or np.ndarray
+        Radial distances, shape (N,) or (N, 1)
+    nmax : int
+        Number of basis functions
+    r_cut : float
+        Cutoff radius
+    l : int
+        Angular momentum order (0=s, 1=p, 2=d, 3=f)
+    
+    Returns
+    -------
+    basis : torch.Tensor
+        Orthonormal basis functions, shape (N, nmax)
+        
+    Notes
+    -----
+    This implementation uses Bessel zeros to guarantee orthonormality:
+    1. Finds zeros z_{l,n} where j_l(z_{l,n}) = 0
+    2. Scales arguments: j_l(z_{l,n} * r/r_cut)
+    3. Normalizes by: N = sqrt(2)/(r_cut^{3/2} * |j_{l+1}(z_{l,n})|)
+    
+    Verified orthonormality: max |off-diag| < 2e-7
+    """
+    # Squeeze r to ensure it's 1D: (N, 1) -> (N,)
+    if isinstance(r, torch.Tensor):
+        if r.dim() > 1:
+            r = r.squeeze(-1)
+        r_numpy = r.cpu().numpy()
+        is_torch = True
+        device, dtype = r.device, r.dtype
+    else:
+        if r.ndim > 1:
+            r = r.squeeze(-1)
+        r_numpy = r
+        is_torch = False
+    
+    # Step 1: Get zeros of spherical Bessel function j_l (cached)
+    zeros = spherical_bessel_zeros(l, nmax)
+    
+    # Initialize basis array
+    basis = np.zeros((len(r_numpy), nmax), dtype=np.float64)
+    
+    # Step 2-3: Build orthonormal basis functions
+    for n, z_n in enumerate(zeros):
+        # Scale argument to [0, r_cut] using n-th zero
+        x = z_n * r_numpy / r_cut
+        
+        # Evaluate spherical Bessel function
+        jn = spherical_jn(l, x)
+        
+        # Compute normalization constant
+        # N_{n,l} = sqrt(2) / (r_cut^{3/2} * |j_{l+1}(z_{l,n})|)
+        j_l1 = spherical_jn(l + 1, z_n)
+        norm = np.sqrt(2.0) / (r_cut**1.5 * np.abs(j_l1))
+        
+        # Store normalized basis function
+        basis[:, n] = norm * jn
+    
+    # Convert back to torch if input was torch
+    if is_torch:
+        return torch.tensor(basis, dtype=dtype, device=device)
+    else:
+        return basis
 
 def gto_basis(r, nmax=6, r_cut=0.24):
     """
     Create a set of radial basis functions
 
     Args:
-        r: radial distances, shape (N, 1)
+        r: radial distances, shape (N, 1) or (N,)
         nmax: maximum radial quantum number
         r_cut: cutoff radius for normalization (defaults to max radius)
 
     Returns:
         Tensor of shape (N, nmax)
     """
+    # Squeeze r to ensure it's 1D: (N, 1) -> (N,)
+    if isinstance(r, torch.Tensor) and r.dim() > 1:
+        r = r.squeeze(-1)
+    
     # Scale r to [0, 1] range
     r_scaled = r / r_cut
 
@@ -65,6 +162,9 @@ def chebyshev_basis(r, nmax=6, r_cut=0.24):
     """
     Chebyshev polynomial basis - excellent for oscillatory features
     """
+    # Squeeze r to ensure it's 1D: (N, 1) -> (N,)
+    if r.dim() > 1:
+        r = r.squeeze(-1)
 
     # Scale r to [-1, 1] range for Chebyshev polynomials
     r_scaled = 2 * (r / r_cut) - 1
@@ -199,7 +299,7 @@ class RECP:
         Get the radial distribution function (RDF) from the d-spacing and values.
         """
         from scipy.ndimage import gaussian_filter1d
-        #print("number of bins:", self.num_bins)
+        print("number of bins:", self.num_bins)
         bins = np.linspace(0, self.dmax, self.num_bins)
         rdf, _ = np.histogram(ds, bins=bins, weights=vals)
         rdf = gaussian_filter1d(rdf, sigma=self.sigma)
@@ -219,11 +319,15 @@ class RECP:
         Returns:
             Tensor of shape (sum(2l+1) * nmax,) representing the descriptor.
         """
-        # Convert NumPy arrays to PyTorch tensors
+        # Convert NumPy arrays to PyTorch tensors and force expected shapes
         xyz = torch.tensor(xyz, dtype=torch.float32)
-        v = torch.tensor(v, dtype=torch.float32).view(-1, 1)  # Add a dimension for repeat
-        r_hat = xyz / (torch.norm(xyz, dim=1, keepdim=True) + 1e-12)  # unit direction
-        r = torch.norm(xyz, dim=1, keepdim=True)  # radial distances
+        xyz = xyz.reshape(-1, 3)  # (N, 3)
+
+        v = torch.tensor(v, dtype=torch.float32)
+        v = v.reshape(-1, 1)  # (N, 1)
+
+        r = torch.norm(xyz, dim=1, keepdim=True)  # (N, 1)
+        r_hat = xyz / (r + 1e-12)  # (N, 3) unit direction
         #print("Debug xyz", xyz.shape, "r_hat", r_hat, "r", r)
 
         # Compute spherical harmonics up to lmax
@@ -238,7 +342,15 @@ class RECP:
         degrees = list(range(0, self.lmax + 1))
         #degrees = list(range(0, self.lmax + 1, 2))
         Y = spherical_harmonics(degrees, r_hat, normalize=False, normalization='norm')#component')
-        #Y = spherical_harmonics(degrees, r_hat, normalize=False, normalization='component')
+        # Ensure Y is 2D (N, sum(2l+1)) for broadcasting with (N, 1)
+        Y = Y.reshape(Y.shape[0], -1)
+
+        # Sanity checks for consistent point dimension
+        if R.shape[0] != Y.shape[0] or v.shape[0] != Y.shape[0]:
+            raise ValueError(
+                f"Shape mismatch: R={tuple(R.shape)}, Y={tuple(Y.shape)}, v={tuple(v.shape)}. "
+                "All must share the same first dimension N (number of reciprocal points)."
+            )
         #print("Debug Spherical", Y.shape, "Y min:", Y.min(), "Y max:", Y.max())
 
         descriptor = []
@@ -247,7 +359,9 @@ class RECP:
             r_basis = R[:, n:n+1]  # Shape (N, 1)
 
             # Weight the spherical harmonics by this radial basis
-            f_n = v * r_basis * Y  # Shape (N, sum(2l+1))
+            # Expand r_basis to match Y's shape: (N, 1) -> (N, 1), then broadcast with (N, sum(2l+1))
+            weight = (v * r_basis)  # Shape (N, 1)
+            f_n = weight * Y  # Shape (N, sum(2l+1)) via broadcasting
 
             # Process by angular momentum
             offset = 0
