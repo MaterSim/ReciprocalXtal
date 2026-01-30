@@ -3,17 +3,28 @@ import sys
 
 # Allow importing sibling reciprocal.py when running as a script
 sys.path.append(str(Path(__file__).resolve().parents[1]))
-
 from pyxtal import pyxtal
 from reciprocal import RECP
 import matplotlib.pyplot as plt
 import numpy as np
 import random
+import os
 
 
 def set_global_seed(seed: int):
     np.random.seed(seed)
     random.seed(seed)
+
+
+def normalize_excluding_first(p, clip=None, eps=1e-12):
+    """Normalize by max(|p[1:]|) to make tail components visible"""
+    p = np.array(p, dtype=float).copy()
+    if clip is not None:
+        p = np.clip(p, -clip, clip)
+    if p.size <= 1:
+        return p
+    scale = np.max(np.abs(p[1:])) + eps
+    return p / scale
 
 
 set_global_seed(42)
@@ -72,20 +83,21 @@ for row, eps in enumerate([0, 0.02, 0.05]):
         else:
             xtal0 = xtal.subgroup_once(H=d[0], eps=eps)
         if xtal0 is not None:
-            p, rdf = recp.compute(xtal0.to_ase(), norm=True)
+            p, rdf = recp.compute(xtal0.to_ase(), norm=False)
         else:
             xtal0 = xtal_sub.subgroup_once(H=d[0], eps=eps)
             if xtal0 is None:
                 print('problem', d[0]); import sys; sys.exit()
-            p, rdf = recp.compute(xtal0.to_ase(), norm=True)
+            p, rdf = recp.compute(xtal0.to_ase(), norm=False)
         data1.append((p, rdf, f'{xtal0.group.number}'))
 
     # Plot p values
     axs[row, 0].set_title(f'$P$ (noise={eps})', y=0.80, x=0.01, loc='left')
     for p, _, label in data1:
-        axs[row, 0].plot(p, label=label, alpha=0.5, lw=1.0)
+        p_plot = normalize_excluding_first(p)
+        axs[row, 0].plot(p_plot, label=label, alpha=0.5, lw=1.0)
 
-
+    axs[row, 0].set_yscale('symlog', linthresh=1e-1)
     axs[row, 0].set_ylabel('$P_{nl}$')
     if row == 2:
         axs[row, 0].set_xlabel('Power Spectrum Index')
@@ -104,5 +116,8 @@ for row, eps in enumerate([0, 0.02, 0.05]):
     if row == 0: axs[row, 1].legend(ncol=2, loc='upper right')
 
 plt.tight_layout()
-plt.savefig('Fig5.png')
+plt.savefig('Fig5.pdf', dpi=300)
 plt.close()
+
+
+
