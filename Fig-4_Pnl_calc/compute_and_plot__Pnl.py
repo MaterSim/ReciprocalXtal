@@ -63,5 +63,5 @@ for row, prototype in enumerate(prototypes):
         axs[row].set_xticklabels([])
     axs[row].set_ylim(0, 1.0)
 plt.tight_layout()
-plt.savefig('Fig-4_Pnl_calc/F.png', dpi=300)
+plt.savefig('Fig4.png', dpi=300)
 plt.close()

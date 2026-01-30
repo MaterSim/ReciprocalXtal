@@ -104,8 +104,5 @@ for row, eps in enumerate([0, 0.02, 0.05]):
     if row == 0: axs[row, 1].legend(ncol=2, loc='upper right')
 
 plt.tight_layout()
-plt.savefig('diamond_noise_robustness.png')
+plt.savefig('Fig5.png')
 plt.close()
-
-
-

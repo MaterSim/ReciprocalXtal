@@ -16,7 +16,7 @@ with importlib.resources.as_file(
     importlib.resources.files("pyxtal") / "database" / "atomic_scattering_params.json"
 ) as path:
     ATOMIC_SCATTERING_PARAMS = loadfn(path)
-  
+
 import torch
 import numpy as np
 from scipy.special import spherical_jn
@@ -26,14 +26,14 @@ from scipy.optimize import brentq
 def spherical_bessel_zeros(l, nmax):
     """
     Compute first nmax zeros of spherical Bessel function j_l(x).
-    
+
     Parameters
     ----------
     l : int
         Angular momentum order (0=s, 1=p, 2=d, etc.)
     nmax : int
         Number of zeros to compute
-    
+
     Returns
     -------
     zeros : np.ndarray
@@ -45,20 +45,20 @@ def spherical_bessel_zeros(l, nmax):
         # Approximate bounds for n-th zero of j_l
         a = (n + l/2 - 0.5) * np.pi
         b = (n + l/2 + 0.5) * np.pi
-        
+
         # Find zero using Brent's method
         z = brentq(lambda x: spherical_jn(l, x), a, b)
         zeros.append(z)
-    
+
     return np.array(zeros, dtype=np.float64)
 
 def bessel_basis(r, nmax=6, r_cut=0.24, l=0):
     """
     ORTHONORMAL spherical Bessel radial basis on [0, r_cut] under r^2 dr measure.
-    
+
     This constructs basis functions that satisfy:
     ∫₀^r_cut r² Rₙ(r) Rₘ(r) dr = δₙₘ (Kronecker delta)
-    
+
     Parameters
     ----------
     r : torch.Tensor or np.ndarray
@@ -69,19 +69,19 @@ def bessel_basis(r, nmax=6, r_cut=0.24, l=0):
         Cutoff radius
     l : int
         Angular momentum order (0=s, 1=p, 2=d, 3=f)
-    
+
     Returns
     -------
     basis : torch.Tensor
         Orthonormal basis functions, shape (N, nmax)
-        
+
     Notes
     -----
     This implementation uses Bessel zeros to guarantee orthonormality:
     1. Finds zeros z_{l,n} where j_l(z_{l,n}) = 0
     2. Scales arguments: j_l(z_{l,n} * r/r_cut)
     3. Normalizes by: N = sqrt(2)/(r_cut^{3/2} * |j_{l+1}(z_{l,n})|)
-    
+
     Verified orthonormality: max |off-diag| < 2e-7
     """
     # Squeeze r to ensure it's 1D: (N, 1) -> (N,)
@@ -96,29 +96,29 @@ def bessel_basis(r, nmax=6, r_cut=0.24, l=0):
             r = r.squeeze(-1)
         r_numpy = r
         is_torch = False
-    
+
     # Step 1: Get zeros of spherical Bessel function j_l (cached)
     zeros = spherical_bessel_zeros(l, nmax)
-    
+
     # Initialize basis array
     basis = np.zeros((len(r_numpy), nmax), dtype=np.float64)
-    
+
     # Step 2-3: Build orthonormal basis functions
     for n, z_n in enumerate(zeros):
         # Scale argument to [0, r_cut] using n-th zero
         x = z_n * r_numpy / r_cut
-        
+
         # Evaluate spherical Bessel function
         jn = spherical_jn(l, x)
-        
+
         # Compute normalization constant
         # N_{n,l} = sqrt(2) / (r_cut^{3/2} * |j_{l+1}(z_{l,n})|)
         j_l1 = spherical_jn(l + 1, z_n)
         norm = np.sqrt(2.0) / (r_cut**1.5 * np.abs(j_l1))
-        
+
         # Store normalized basis function
         basis[:, n] = norm * jn
-    
+
     # Convert back to torch if input was torch
     if is_torch:
         return torch.tensor(basis, dtype=dtype, device=device)
@@ -140,7 +140,7 @@ def gto_basis(r, nmax=6, r_cut=0.24):
     # Squeeze r to ensure it's 1D: (N, 1) -> (N,)
     if isinstance(r, torch.Tensor) and r.dim() > 1:
         r = r.squeeze(-1)
-    
+
     # Scale r to [0, 1] range
     r_scaled = r / r_cut
 
@@ -158,7 +158,7 @@ def gto_basis(r, nmax=6, r_cut=0.24):
 
     return basis  # Shape (N, nmax)
 
-def chebyshev_basis(r, nmax=6, r_cut=0.24):
+def chebyshev_basis(r, nmax=6, r_cut=0.24, normalize=True):
     """
     Chebyshev polynomial basis - excellent for oscillatory features
     """
@@ -179,6 +179,20 @@ def chebyshev_basis(r, nmax=6, r_cut=0.24):
     for n in range(2, nmax):
         basis[:, n] = 2 * r_scaled.view(-1) * basis[:, n-1] - basis[:, n-2]
 
+    # Normalize each basis function with Chebyshev weight
+    if normalize:
+        x_vals = r_scaled.view(-1)
+        dx = x_vals[1] - x_vals[0] if len(x_vals) > 1 else 1.0
+        # Chebyshev weight: 1/sqrt(1-x^2), avoiding singularities
+        weights = 1.0 / torch.sqrt(torch.clamp(1 - x_vals**2, min=1e-10))
+        weights = weights * dx
+ 
+        for n in range(nmax):
+            # Compute norm with Chebyshev weight
+            norm_sq = torch.sum(weights * basis[:, n] ** 2)
+            if norm_sq > 1e-10:
+                basis[:, n] /= torch.sqrt(norm_sq)
+ 
     return basis
 
 class RECP:
@@ -480,15 +494,107 @@ class RECP:
 if __name__ == "__main__":
     from pyxtal import pyxtal
 
-    xtal1 = pyxtal(); xtal1.from_prototype('diamond') #; xtal.to_file('dia.cif'); print(xtal)
-    xtal_sub = xtal1.subgroup_once(H=141, eps=0.1); print(xtal_sub)
-    xtal2 = pyxtal(); xtal2.from_prototype('graphite')
-    xtal3 = xtal1.copy(); xtal3.substitute({'C': 'Si'});
-    xtal3.lattice = xtal3.lattice.scale(1.52); print(xtal3)
+    #xtal1 = pyxtal(); xtal1.from_prototype('diamond') #; xtal.to_file('dia.cif'); print(xtal)
+    #xtal_sub = xtal1.subgroup_once(H=141, eps=0.1); print(xtal_sub)
+    #xtal2 = pyxtal(); xtal2.from_prototype('graphite')
+    #xtal3 = xtal1.copy(); xtal3.substitute({'C': 'Si'});
+    #xtal3.lattice = xtal3.lattice.scale(1.52); print(xtal3)
 
-    recp = RECP(dmax=8.0, nmax=5, lmax=3)
-    p1, rdf1 = recp.compute(xtal1.to_ase())
-    p2, rdf2 = recp.compute(xtal1.to_ase()*2)
-    p3, rdf3 = recp.compute(xtal_sub.to_ase())
-    p4, rdf4 = recp.compute(xtal2.to_ase())
-    p5, rdf5 = recp.compute(xtal3.to_ase())
+    #recp = RECP(dmax=8.0, nmax=5, lmax=3)
+    #p1, rdf1 = recp.compute(xtal1.to_ase())
+    #p2, rdf2 = recp.compute(xtal1.to_ase()*2)
+    #p3, rdf3 = recp.compute(xtal_sub.to_ase())
+    #p4, rdf4 = recp.compute(xtal2.to_ase())
+    #p5, rdf5 = recp.compute(xtal3.to_ase())
+    import matplotlib.pyplot as plt
+    r = torch.linspace(0, 0.24, 1000).view(-1, 1)
+    bessel_basis = bessel_basis(r, nmax=5, r_cut=0.24)
+    chebyshev_basis = chebyshev_basis(r, nmax=5, r_cut=0.24)
+    plt.figure(figsize=(10, 8))
+
+    # Plot Bessel basis functions
+    plt.subplot(2, 1, 1)
+    r_plot = r.view(-1).numpy()
+    for i in range(bessel_basis.shape[1]):
+        plt.plot(r_plot / r.max(), bessel_basis[:, i].numpy(), label=f'n={i}')
+    plt.title('Bessel Basis')
+    plt.xlabel(r'$d/d_{\mathrm{max}}$')
+    plt.ylabel('Basis Value')
+    plt.legend()
+
+    # Plot Chebyshev basis functions
+    plt.subplot(2, 1, 2)
+    for i in range(chebyshev_basis.shape[1]):
+        plt.plot(r_plot / r.max(), chebyshev_basis[:, i].numpy(), label=f'n={i}')
+    plt.title('Chebyshev Basis')
+    plt.xlabel(r'$d/d_{\mathrm{max}}$')
+    plt.ylabel('Basis Value')
+    plt.legend()
+
+    plt.tight_layout()
+    plt.savefig('Fig3.png', dpi=300)
+    plt.close()
+
+    # Test orthonormality of Bessel basis functions
+    print("\n=== Testing Orthonormality of Bessel Basis Functions ===")
+    print("Computing weighted inner product with weight r^2 (proper for spherical Bessel functions)\n")
+
+    # Compute r^2 weights for integration
+    r_vals = r.view(-1)
+    dr = r_vals[1] - r_vals[0]  # Grid spacing
+
+    # Combined weight: r^2 * dr
+    weights_bessel = r_vals ** 2 * dr
+
+    gram_matrix_unweighted = torch.zeros((bessel_basis.shape[1], bessel_basis.shape[1]))
+    gram_matrix_weighted = torch.zeros((bessel_basis.shape[1], bessel_basis.shape[1]))
+
+    for i in range(bessel_basis.shape[1]):
+        for j in range(bessel_basis.shape[1]):
+            # Unweighted inner product
+            gram_matrix_unweighted[i, j] = torch.sum(bessel_basis[:, i] * bessel_basis[:, j]) * dr
+            # Weighted inner product with r^2
+            gram_matrix_weighted[i, j] = torch.sum(weights_bessel * bessel_basis[:, i] * bessel_basis[:, j])
+
+    print("Gram Matrix (unweighted):")
+    print(gram_matrix_unweighted)
+    print("\nGram Matrix (weighted with r^2):")
+    print(gram_matrix_weighted)
+
+    identity = torch.eye(bessel_basis.shape[1])
+    ortho_error = torch.norm(gram_matrix_weighted - identity, p='fro')
+    max_off_diag = torch.max(torch.abs(gram_matrix_weighted - torch.diag(torch.diag(gram_matrix_weighted))))
+    print(f"\nOrthonormality error (Frobenius norm): {ortho_error.item():.6e}")
+    print(f"Max off-diagonal: {max_off_diag.item():.6e}")
+
+    # Test orthonormality of Chebyshev basis functions
+    print("\n=== Testing Orthonormality of Chebyshev Basis Functions ===")
+    print("Computing weighted inner product with Chebyshev weight w(x) = 1/sqrt(1-x^2)\n")
+
+    # Scale r to [-1, 1] for Chebyshev weight
+    x_cheb = 2 * (r_vals / 0.24) - 1
+    dx = x_cheb[1] - x_cheb[0]
+
+    # Chebyshev weight function: 1/sqrt(1-x^2), avoiding singularities
+    cheb_weight = 1.0 / torch.sqrt(torch.clamp(1 - x_cheb**2, min=1e-10))
+    weights_cheb = cheb_weight * dx
+
+    gram_matrix_cheb_unweighted = torch.zeros((chebyshev_basis.shape[1], chebyshev_basis.shape[1]))
+    gram_matrix_cheb_weighted = torch.zeros((chebyshev_basis.shape[1], chebyshev_basis.shape[1]))
+
+    for i in range(chebyshev_basis.shape[1]):
+        for j in range(chebyshev_basis.shape[1]):
+            # Unweighted inner product
+            gram_matrix_cheb_unweighted[i, j] = torch.sum(chebyshev_basis[:, i] * chebyshev_basis[:, j]) * dx
+            # Weighted inner product with Chebyshev weight
+            gram_matrix_cheb_weighted[i, j] = torch.sum(weights_cheb * chebyshev_basis[:, i] * chebyshev_basis[:, j])
+
+    print("Gram Matrix (unweighted):")
+    print(gram_matrix_cheb_unweighted)
+    print("\nGram Matrix (weighted with 1/sqrt(1-x^2)):")
+    print(gram_matrix_cheb_weighted)
+    identity = torch.eye(chebyshev_basis.shape[1])
+    ortho_error = torch.norm(gram_matrix_cheb_weighted - identity, p='fro')
+    max_off_diag = torch.max(torch.abs(gram_matrix_cheb_weighted - torch.diag(torch.diag(gram_matrix_cheb_weighted))))
+    print(f"\nOrthonormality error (Frobenius norm): {ortho_error.item():.6e}")
+    print(f"Max off-diagonal: {max_off_diag.item():.6e}")
