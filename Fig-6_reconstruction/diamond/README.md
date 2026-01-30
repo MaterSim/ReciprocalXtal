@@ -38,9 +38,9 @@ def perturb_structure(self, d_lat, d_coor):
     return xtal_pert, rep0
 ```
 
-**Perturbation parameters:**
-- **Diamond**: $(d_{\text{lat}}, d_{\text{coor}}) = (0.1, 0.3)$
-- **Hexagonal Diamond**: $(d_{\text{lat}}, d_{\text{coor}}) = (0.15, 0.45)$
+**Perturbation parameters used :**
+- **Diamond**: $(d_{\text{lat}}, d_{\text{coor}}) = (0.5, 0.5)$
+- **Hexagonal Diamond**: $(d_{\text{lat}}, d_{\text{coor}}) = (0.2, 1.0)$
 
 ## Real-Space RDF Calculation
 

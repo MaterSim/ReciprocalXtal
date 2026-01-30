@@ -13,8 +13,8 @@ This module reconstructs α- and β-quartz structures from perturbed configurati
 
 Perturbations are generated with PyXtal's `apply_perturbation()` on the reference structure, then normalized for optimization. Current settings in `reconstruct_quartz.py`:
 
-- α quartz: $d_{lat}=0.02$, $d_{coor}=0.5$ Å
-- β quartz: $d_{lat}=0.30$, $d_{coor}=1.6$ Å
+- α quartz: $d_{lat}=0.1$, $d_{coor}=0.9$ Å
+- β quartz: $d_{lat}=0.2$, $d_{coor}=1.8$ Å
 
 ## Real-Space RDF Calculation
 

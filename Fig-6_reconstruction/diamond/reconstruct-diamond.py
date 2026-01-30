@@ -4,6 +4,11 @@ import sys
 # Allow importing project-level reciprocal.py when running as a script
 sys.path.append(str(Path(__file__).resolve().parents[2]))
 
+import os
+# Set environment variables BEFORE importing numpy/scipy for deterministic BLAS
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
 
 import numpy as np
 from scipy.optimize import minimize
@@ -268,27 +273,36 @@ class InverseOptimizer:
         print(f"  Total function calls: {self.n_calls}")
         
         return result
-    ''' 
-    def perturb_structure(self, d_lat, d_coor):
+     
+    def perturb_structure(self, d_lat=0.5, d_coor=0.5):
         """
-        Generate perturbed structure with lattice and coordinate noise.
+        Create a perturbed 1D representation.
         
         Args:
-            d_lat: relative lattice perturbation magnitude
-            d_coor: Cartesian coordinate displacement magnitude (Å)
+            perturbation: relative perturbation (0.05 = 5%)
         
         Returns:
-            xtal_perturbed: perturbed pyxtal object
-            rep0: normalized 1D representation for optimization
+            xtal_perturbed: pyxtal object with perturbed structure
+            rep0: perturbed 1D representation
         """
+        print(f"ref xtal before perturbation: {self.ref_xtal}")
+        xtal_pert = pyxtal()
+        #xtal_pert.from_seed('cifs/a_quartz_pert200_perturbed.cif')
+        #xtal_pert.from_spg_wps_rep(166,['6c'],[2.522, 6.178, 0.125])
         xtal_pert = deepcopy(self.ref_xtal)
+        # Ensure lattice inherits the seeded random_state from parent pyxtal
         if hasattr(xtal_pert, 'random_state') and hasattr(xtal_pert.lattice, 'random_state'):
             xtal_pert.lattice.random_state = xtal_pert.random_state.spawn(1)[0]
-        
         xtal_pert.apply_perturbation(d_lat=d_lat, d_coor=d_coor)
-        rep0 = self._normalize_rep(xtal_pert.get_1d_rep_x())
+
+        #xtal_pert = self.ref_xtal.subgroup_once(H=166, eps=perturbation)
+        rep0= self._normalize_rep(xtal_pert.get_1d_rep_x())
         
-        return xtal_pert, rep0
+        print(f"Perturbed structure: {xtal_pert}") ##;exit()
+        p_pert, rdf_pert = self.recp.compute(xtal_pert.to_ase(), norm=False)
+        print(f"Perturbed descriptor shape: {p_pert.shape}")
+        
+        return xtal_pert, rep0, d_lat, d_coor
     '''
     def perturb_structure(self,prototype='diamond'):
         """
@@ -318,7 +332,7 @@ class InverseOptimizer:
         print(f"Perturbed structure: {xtal_pert}") ##;exit()
         
         return xtal_pert, rep0
-    
+    ''' 
     def get_optimized_structure(self, rep_opt):
         """
         Reconstruct the optimized structure from 1D representation.
@@ -328,7 +342,7 @@ class InverseOptimizer:
         return xtal_opt
 
 
-def main(prototype='diamond'):
+def main(prototype='diamond', d_lat=0.5, d_coor=0.5):
     # fix all random seeds for reproducibility
     set_global_seed(42)
     """
@@ -348,7 +362,7 @@ def main(prototype='diamond'):
         #xtal_ref.from_prototype('diamond')
        #print(f"\nReference structure: {xtal_ref}");exit()
     elif prototype == 'h-diamond':
-        hdia = pyxtal()
+        hdia = pyxtal(random_state=42)
         hdia.from_prototype('h-diamond')
         xtal_ref=hdia.subgroup_once(H=193, eps=0)
         #print(f"\nReference structure: {xtal_ref}");exit()
@@ -362,14 +376,15 @@ def main(prototype='diamond'):
     optimizer = InverseOptimizer(
         xtal_ref,
         recp_params=recp_params,
-        weight_descriptor=1.0,
+        weight_descriptor=2.0,
         weight_rdf=1
     )
     
     # Perturb and get initial point
     print("\n" + "-" * 70)
+    print(f"PERTURBATION STEP (lat={int(d_lat*100)}%, coor={d_coor:.2f}Å)")
     print("-" * 70)
-    xtal_pert, rep0 = optimizer.perturb_structure(prototype=prototype)
+    xtal_pert, rep0, d_lat, d_coor = optimizer.perturb_structure(d_lat=d_lat, d_coor=d_coor)
     
     # Compute perturbed descriptor (reciprocal) and both RDF types
     p_pert, _ = optimizer.recp.compute(xtal_pert.to_ase(), norm=False)
@@ -414,6 +429,20 @@ def main(prototype='diamond'):
     
     p_ref_numpy = optimizer.p_ref_numpy
     p_opt_numpy = p_opt.detach().numpy()
+    # ---- Option A (visualization): normalize by max(|p[1:]|) so the tail is visible ----
+    def normalize_excluding_first(p, clip=None, eps=1e-12):
+        p = np.array(p, dtype=float).copy()
+        if clip is not None:
+            p = np.clip(p, -clip, clip)
+        if p.size <= 1:
+            return p
+        scale = np.max(np.abs(p[1:])) + eps
+        return p / scale
+
+    # Use these *only for plotting* (do not change the raw descriptors used in the loss)
+    p_ref_plot  = normalize_excluding_first(p_ref_numpy,  clip=None)
+    p_pert_plot = normalize_excluding_first(p_pert_numpy, clip=None)
+    p_opt_plot  = normalize_excluding_first(p_opt_numpy,  clip=None)
     
     # Save structures
     print(f"\nSaving structures...")
@@ -422,10 +451,11 @@ def main(prototype='diamond'):
     os.makedirs('fig', exist_ok=True)
     
     name = prototype.replace('-', '_')
+    pert_str = f"lat{int(d_lat*100):02d}_coor{int(d_coor*100):02d}"
     
     ref_file = f'cifs/{name}_reference.cif'
-    pert_file = f'cifs/{name}_perturbed.cif'
-    opt_file = f'cifs/{name}_reconstructed.cif'
+    pert_file = f'cifs/{name}_{pert_str}_perturbed.cif'
+    opt_file = f'cifs/{name}_{pert_str}_optimized.cif'
     
     xtal_ref.to_file(ref_file)
     xtal_pert.to_file(pert_file)
@@ -442,7 +472,7 @@ def main(prototype='diamond'):
     
     # Font sizes for journal manuscript (half-page figure)
     font_size_label = 12
-    font_size_title = 12
+    font_size_title = 11
     font_size_legend = 10
     font_size_tick = 9
     
@@ -455,10 +485,12 @@ def main(prototype='diamond'):
     
     # Upper row: Reference vs Perturbed
     # Column 0: Power Spectrum
-    axs[0, 0].plot(p_ref_numpy, label='Reference', alpha=0.8, lw=1.0)
-    axs[0, 0].plot(p_pert_numpy, label='Perturbed', alpha=0.8, lw=1.0)
+    axs[0, 0].plot(p_ref_plot, label='Reference', alpha=0.8, lw=1.0)
+    axs[0, 0].plot(p_pert_plot, label='Perturbed', alpha=0.8, lw=1.0)
+    # Use a symmetric log scale to reveal small components
+    axs[0, 0].set_yscale('symlog', linthresh=1e-1)
     axs[0, 0].set_ylabel('$P_{nl}$', fontsize=font_size_label)
-    axs[0, 0].set_title('(a) Power Spectrum', fontsize=font_size_title, fontweight='bold')
+    axs[0, 0].set_title('Power Spectrum', fontsize=font_size_title)
     axs[0, 0].legend(fontsize=font_size_legend, loc='upper left', frameon=True, fancybox=True)
     axs[0, 0].tick_params(labelsize=font_size_tick)
     #axs[0, 0].grid(True, alpha=0.3, linestyle='--')
@@ -472,16 +504,17 @@ def main(prototype='diamond'):
         rdf_pert_mean = rdf_pert_real_full
     axs[0, 1].plot(x_rdf_real, rdf_ref_mean, label='Reference', alpha=0.8, lw=1.0)
     axs[0, 1].plot(x_rdf_real, rdf_pert_mean, label='Perturbed', alpha=0.8, lw=1.0, linestyle='--')
-    axs[0, 1].set_ylabel('RDF', fontsize=font_size_label)
-    axs[0, 1].set_title('(b) RDF', fontsize=font_size_title, fontweight='bold')
+    axs[0, 1].set_ylabel('$G(r)$', fontsize=font_size_label)
+    axs[0, 1].set_title('RDF', fontsize=font_size_title)
     axs[0, 1].legend(fontsize=font_size_legend, loc='upper left', frameon=True, fancybox=True)
     axs[0, 1].tick_params(labelsize=font_size_tick)
     #axs[0, 1].grid(True, alpha=0.3, linestyle='--')
     
     # Lower row: Reference vs Optimized
     # Column 0: Power Spectrum
-    axs[1, 0].plot(p_ref_numpy, label='Reference', alpha=0.8, lw=1.0)
-    axs[1, 0].plot(p_opt_numpy, label='Optimized', alpha=0.8, lw=1.0)
+    axs[1, 0].plot(p_ref_plot, label='Reference', alpha=0.8, lw=1.0)
+    axs[1, 0].plot(p_opt_plot, label='Optimized', alpha=0.8, lw=1.0)
+    axs[1, 0].set_yscale('symlog', linthresh=1e-1)
     axs[1, 0].set_xlabel('Power Spectrum Index', fontsize=font_size_label)
     axs[1, 0].set_ylabel('$P_{nl}$', fontsize=font_size_label)
     #axs[1, 0].set_title('(c) Power Spectrum: Ref vs Opt', fontsize=font_size_title, fontweight='bold', loc='left')
@@ -497,7 +530,7 @@ def main(prototype='diamond'):
     axs[1, 1].plot(x_rdf_real, rdf_ref_mean, label='Reference', alpha=0.8, lw=1.0)
     axs[1, 1].plot(x_rdf_real, rdf_opt_mean, label='Optimized', alpha=0.8, lw=1.0, linestyle='--')
     axs[1, 1].set_xlabel('r (Å)', fontsize=font_size_label)
-    axs[1, 1].set_ylabel('RDF', fontsize=font_size_label)
+    axs[1, 1].set_ylabel('$G(r)$', fontsize=font_size_label)
     axs[1, 1].legend(fontsize=font_size_legend, loc='upper left', frameon=True, fancybox=True)
     axs[1, 1].tick_params(labelsize=font_size_tick)
     
@@ -506,7 +539,7 @@ def main(prototype='diamond'):
     #             fontsize=13, fontweight='bold', y=0.98)
     plt.tight_layout(rect=[0, 0, 1, 0.97])
     
-    fig_file = f'fig/{name}_inverse_optimization_plot.png'
+    fig_file = f'fig/{name}_{pert_str}_reconstruction.png'
     plt.savefig(fig_file, dpi=300)
     plt.close()
     print(f"  {fig_file}")
@@ -516,6 +549,8 @@ if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser(description='Inverse Optimization of Crystal Structure using RECIPROCAL-space Descriptors')
     parser.add_argument('--prototype', type=str, default='diamond', help='Structure prototype (default: diamond)')
+    parser.add_argument('--d-lat', type=float, default=0.5, help='Lattice perturbation magnitude (relative)')
+    parser.add_argument('--d-coor', type=float, default=0.5, help='Coordinate perturbation magnitude (Å)')
     args = parser.parse_args()
 
-    main(prototype=args.prototype)
+    main(prototype=args.prototype, d_lat=args.d_lat, d_coor=args.d_coor)

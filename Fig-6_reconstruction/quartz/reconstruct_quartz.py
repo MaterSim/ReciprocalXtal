@@ -1,9 +1,20 @@
+"""
+Inverse optimization for quartz structures: lattice and Wyckoff coordinate recovery.
+
+Perturbs α-quartz and β-quartz structures, then optimizes lattice parameters and
+Wyckoff coordinates to recover the reference reciprocal-space descriptor using
+combined reciprocal-space (RECP) and real-space (pairwise RDF) descriptors.
+"""
 from pathlib import Path
 import sys
 
-# Allow importing project-level reciprocal.py when running as a script
 sys.path.append(str(Path(__file__).resolve().parents[2]))
+
 import os
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
+os.environ['OPENBLAS_NUM_THREADS'] = '1'
+
 import numpy as np
 from scipy.optimize import minimize
 from pyxtal import pyxtal
@@ -71,9 +82,8 @@ class InverseOptimizer:
         self.p_ref_numpy = self.p_ref.detach().numpy()
         self.rdf_ref_numpy = self.rdf_ref
         
-        # Store sizes for MAE calculation
         self.p_size = len(self.p_ref_numpy)
-        self.rdf_size = self.rdf_ref_numpy.shape[0]  # num_pairs
+        self.rdf_size = self.rdf_ref_numpy.shape[0]
         
         print(f"Reference descriptor size: {self.p_size}")
         print(f"Reference RDF size: {self.rdf_size}")
@@ -81,14 +91,11 @@ class InverseOptimizer:
         
         self.weight_p = weight_descriptor
         self.weight_rdf = weight_rdf
-        # per-pair multipliers (e.g. {'Si-Si': 2.0, 'O-O': 2.0})
         self.pair_weights = pair_weights if pair_weights is not None else {}
         
-        # Storage for optimization
         self.loss_history = []
         self.n_calls = 0
         
-        #print(f"Reference structure: {self.ref_xtal}")
         print(f"Reference descriptor shape: {self.p_ref_numpy.shape}")
         print(f"Reference RDF shape: {self.rdf_ref_numpy.shape}")
         
@@ -97,6 +104,7 @@ class InverseOptimizer:
         return Lattice.get_dofs(self.ref_xtal.lattice.ltype)
 
     def _normalize_rep(self, rep):
+        """Normalize 1D representation by dividing lattice and angle components."""
         repn = rep.copy()
         N_abc, N_ang = self._get_lattice_dofs()
         if len(repn) >= N_abc:
@@ -106,6 +114,7 @@ class InverseOptimizer:
         return repn
 
     def _denormalize_rep(self, rep):
+        """Denormalize 1D representation by multiplying lattice and angle components."""
         repd = rep.copy()
         N_abc, N_ang = self._get_lattice_dofs()
         if len(repd) >= N_abc:
@@ -124,20 +133,16 @@ class InverseOptimizer:
         Returns:
             loss: scalar (weighted sum of descriptor and RDF losses)
         """
-        # Create a copy and update the 1D representation (denormalize first)
         xtal_current = deepcopy(self.ref_xtal)
         rep_denorm = self._denormalize_rep(rep)
         xtal_current.update_from_1d_rep(rep_denorm)
         
-        # Compute descriptor P
         coords_cur, vals_cur, ds_cur = self.recp.build_reciprocal(xtal_current.to_ase())
         p_current = self.recp.compute_sph_torch(coords_cur, vals_cur, norm=False)
         p_current_numpy = p_current.detach().numpy()
         
-        # Descriptor loss (normalized L2 norm / RMSE)
         loss_p = np.linalg.norm(p_current_numpy - self.p_ref_numpy) / np.sqrt(len(p_current_numpy))
         
-        # RDF loss (pairwise real-space RDF)
         rdf_current, rdf_current_labels = self.rdf_calc.compute_rdf(
             xtal_current.to_ase(), mode='pairwise', num_bins=50, sigma=2.0
         )
@@ -147,32 +152,20 @@ class InverseOptimizer:
         for pair_idx in range(n_pairs):
             rdf_ref_elem = self.rdf_ref_numpy[pair_idx, :]
             rdf_cur_elem = rdf_current[pair_idx, :]
-
-            # Unnormalized L2 over bins (scaled by sqrt of bins for RMS)
             elem_l2 = np.linalg.norm(rdf_cur_elem - rdf_ref_elem) / np.sqrt(len(rdf_ref_elem))
-
-            # Get label for weighting
             label = rdf_current_labels[pair_idx] if pair_idx < len(rdf_current_labels) else None
             multiplier = float(self.pair_weights.get(label, 1.0)) if label else 1.0
-
             pair_losses.append(multiplier * elem_l2)
         
         loss_rdf = np.sum(pair_losses)
-
-        # Combined loss (MAE - both terms already normalized)
         loss = self.weight_p * loss_p + self.weight_rdf * loss_rdf
-        # Debug: print per-element losses occasionally
+        
         if self.n_calls % 10 == 1:
-            per_pair_str = ', '.join(f"{x:.6e}" for x in pair_losses)
-            print(f"Iteration {self.n_calls}: loss={loss:.6e}, loss_p={loss_p:.6e}, sum_pair_L2={loss_rdf:.6e} \n rep={rep} ")
+            print(f"Iteration {self.n_calls}: loss={loss:.6e}, loss_p={loss_p:.6e}, sum_pair_L2={loss_rdf:.6e}")
         
         self.loss_history.append(loss)
         self.n_calls += 1
         
-        #if self.n_calls % 10 == 0 or self.n_calls == 1:
-        #    print(f"  Iteration {self.n_calls}: loss={loss:.6e}, loss_p={loss_p:.6e}, loss_rdf={loss_rdf:.6e}")
-        
-        # Store individual losses for analysis
         if not hasattr(self, 'loss_p_history'):
             self.loss_p_history = []
             self.loss_rdf_history = []
@@ -261,29 +254,35 @@ class InverseOptimizer:
         
         return result
     
-    def perturb_structure(self, prototype='a-quartz'):
+    def perturb_structure(self, d_lat=0.1, d_coor=0.9):
         """
-        Generate perturbed structure with lattice and coordinate noise.
+        Create a perturbed 1D representation.
         
         Args:
-            d_lat: relative lattice perturbation magnitude
-            d_coor: Cartesian coordinate displacement magnitude (Å)
+            d_lat: lattice perturbation magnitude (relative)
+            d_coor: coordinate perturbation magnitude (Å)
         
         Returns:
-            xtal_perturbed: perturbed pyxtal object
-            rep0: normalized 1D representation for optimization
+            xtal_perturbed: pyxtal object with perturbed structure
+            rep0: perturbed 1D representation
+            d_lat: lattice perturbation used
+            d_coor: coordinate perturbation used
         """
         xtal_pert = deepcopy(self.ref_xtal)
         if hasattr(xtal_pert, 'random_state') and hasattr(xtal_pert.lattice, 'random_state'):
             xtal_pert.lattice.random_state = xtal_pert.random_state.spawn(1)[0]
-        if prototype == 'a-quartz':
-            xtal_pert.apply_perturbation(d_lat=0.02, d_coor=0.5)
-        elif prototype == 'b-quartz':
-            xtal_pert.apply_perturbation(d_lat=0.3, d_coor=1.6)
-        rep0 = self._normalize_rep(xtal_pert.get_1d_rep_x())
+        xtal_pert.apply_perturbation(d_lat=d_lat, d_coor=d_coor)
+        #xtal_pert.subgroup_once(H=154, eps=perturbation)
+        # return normalized rep for optimization
+        #xtal_pert = pyxtal()
+        #xtal_pert.from_seed('final_21jan/a_quartz_pert200_perturbed.cif')
+        rep0= self._normalize_rep(xtal_pert.get_1d_rep_x())
         
-        return xtal_pert, rep0
-
+        print(f"Perturbed structure: {xtal_pert}")
+        p_pert, rdf_pert = self.recp.compute(xtal_pert.to_ase(), norm=False)
+        print(f"Perturbed descriptor shape: {p_pert.shape}")
+        
+        return xtal_pert, rep0, d_lat, d_coor
     
     def get_optimized_structure(self, rep_opt):
         """
@@ -294,17 +293,10 @@ class InverseOptimizer:
         return xtal_opt
 
 
-def main(prototype='a-quartz'):
-    """
-    Main workflow: create reference → perturb → optimize → compare.
-    
-    Args:
-        prototype: structure prototype name (e.g., 'diamond', 'a-quartz', 'graphite')
-    """
-    # Fix all random seeds FIRST, before any structure operations
+def main(prototype='a-quartz', d_lat=0.1, d_coor=0.9):
+    """Inverse optimization workflow: reference → perturb → optimize → compare."""
     set_global_seed(42)
     
-    # Create reference structure
     print("=" * 70)
     print(f"RECIPROCAL-SPACE INVERSE OPTIMIZATION ({prototype})")
     print("=" * 70)
@@ -312,35 +304,29 @@ def main(prototype='a-quartz'):
     xtal_ref = pyxtal(random_state=42)
     xtal_ref.from_prototype(prototype)
     print(f"\nReference structure: {xtal_ref}")
+    
     #print(xtal_ref);exit()
     #xtal_ref.from_seed('cifs/a_quartz_pert30_perturbed.cif')
     
     # Initialize optimizer
-    recp_params = {'dmax': 5, 'nmax': 10, 'lmax': 10, 'rbasis': 'bessel', 'rcut': 2.1}
-    if prototype == 'b-quartz':
-        optimizer = InverseOptimizer(
-            xtal_ref,
-            recp_params=recp_params,
-            weight_descriptor=2.0,
-            weight_rdf=0.1,
-            pair_weights={'Si-Si': 2.0, 'Si-O': 1.0, 'O-O': 2.0, 'O-Si': 1.0}
-        )
-    elif prototype == 'a-quartz':
-        optimizer = InverseOptimizer(
-            xtal_ref,
-            recp_params=recp_params,
-            weight_descriptor=2.0,
-            weight_rdf=1,
-            pair_weights={'Si-Si': 2.0, 'Si-O': 1.0, 'O-O': 2.0, 'O-Si': 1.0}
-        )
+    recp_params = {'dmax': 10, 'nmax': 10, 'lmax': 10, 'rbasis': 'bessel', 'rcut': 2.1}
+    optimizer = InverseOptimizer(
+        xtal_ref,
+        recp_params=recp_params,
+        weight_descriptor=2.0,
+        weight_rdf=0.1,
+        pair_weights={'Si-Si': 2.0, 'Si-O': 1.0, 'O-O': 2.0, 'O-Si': 1.0}
+    )
     
     # Perturb and get initial point
     print("\n" + "-" * 70)
+    print(f"PERTURBATION STEP (lat={int(d_lat*100)}%, coor={d_coor:.2f}Å)")
     print("-" * 70)
-    xtal_pert, rep0 = optimizer.perturb_structure(prototype=prototype)
+    xtal_pert, rep0, d_lat, d_coor = optimizer.perturb_structure(d_lat=d_lat, d_coor=d_coor)
     
     # Compute perturbed descriptor and RDF
     p_pert, _ = optimizer.recp.compute(xtal_pert.to_ase(), norm=False)
+    #print(f"Perturbed descriptor shape: {p_pert}");exit()
     p_pert_numpy = p_pert.detach().numpy()
     
     # Compute reference and perturbed RDFs for plotting
@@ -378,6 +364,24 @@ def main(prototype='a-quartz'):
     
     p_ref_numpy = optimizer.p_ref_numpy
     p_opt_numpy = p_opt.detach().numpy()
+
+    # ---- Option A (visualization): normalize by max(|p[1:]|) so the tail is visible ----
+    def normalize_excluding_first(p, clip=None, eps=1e-12):
+        p = np.array(p, dtype=float).copy()
+        if clip is not None:
+            p = np.clip(p, -clip, clip)
+        if p.size <= 1:
+            return p
+        scale = np.max(np.abs(p[1:])) + eps
+        return p / scale
+
+    # Use these *only for plotting* (do not change the raw descriptors used in the loss)
+    p_ref_plot  = normalize_excluding_first(p_ref_numpy,  clip=None)
+    p_pert_plot = normalize_excluding_first(p_pert_numpy, clip=None)
+    p_opt_plot  = normalize_excluding_first(p_opt_numpy,  clip=None)
+
+    # Optionally report the dominant term for context
+    print(f"P[0] raw (ref/pert/opt): {p_ref_numpy[0]:.3e} / {p_pert_numpy[0]:.3e} / {p_opt_numpy[0]:.3e}")
     
     # Save structures
     print(f"\nSaving structures...")
@@ -386,10 +390,11 @@ def main(prototype='a-quartz'):
     os.makedirs('fig', exist_ok=True)
     
     name = prototype.replace('-', '_')
+    pert_str = f"lat{int(d_lat*100):02d}_coor{int(d_coor*100):02d}"
     
     ref_file = f'cifs/{name}_reference.cif'
-    pert_file = f'cifs/{name}_perturbed.cif'
-    opt_file = f'cifs/{name}_optimized.cif'
+    pert_file = f'cifs/{name}_{pert_str}_perturbed.cif'
+    opt_file = f'cifs/{name}_{pert_str}_optimized.cif'
     
     xtal_ref.to_file(ref_file)
     xtal_pert.to_file(pert_file)
@@ -406,7 +411,7 @@ def main(prototype='a-quartz'):
     
     # Font sizes for journal manuscript (half-page figure)
     font_size_label = 12
-    font_size_title = 12
+    font_size_title = 11
     font_size_legend = 10
     font_size_tick = 9
     
@@ -415,10 +420,12 @@ def main(prototype='a-quartz'):
     
     # Upper row: Reference vs Perturbed
     # Column 0: Power Spectrum
-    axs[0, 0].plot(p_ref_numpy, label='Reference', alpha=0.8, lw=1.0)
-    axs[0, 0].plot(p_pert_numpy, label='Perturbed', alpha=0.8, lw=1.0)
+    axs[0, 0].plot(p_ref_plot, label='Reference', alpha=0.8, lw=1.0)
+    axs[0, 0].plot(p_pert_plot, label='Perturbed', alpha=0.8, lw=1.0)
+    # Use a symmetric log scale to reveal small components while keeping the dominant first term
+    axs[0, 0].set_yscale('symlog', linthresh=1e-1)
     axs[0, 0].set_ylabel('$P_{nl}$', fontsize=font_size_label)
-    axs[0, 0].set_title('(a) Power Spectrum', fontsize=font_size_title, fontweight='bold')
+    axs[0, 0].set_title('Power Spectrum', fontsize=font_size_title)
     axs[0, 0].legend(fontsize=font_size_legend, loc='upper left', frameon=True, fancybox=True)
     axs[0, 0].tick_params(labelsize=font_size_tick)
     #axs[0, 0].grid(True, alpha=0.3, linestyle='--')
@@ -434,17 +441,19 @@ def main(prototype='a-quartz'):
                     label=f'{label} Ref', alpha=0.8, lw=1.0, color=c_ref)
             axs[0, 1].plot(x_rdf_real, rdf_pert_real[pair_idx], 
                     label=f'{label} Pert', alpha=0.8, lw=1.0, linestyle='--', color=c_pert)
-            axs[0, 1].set_ylabel('RDF', fontsize=font_size_label)
+            axs[0, 1].set_ylabel('G(r)', fontsize=font_size_label)
     #axs[0, 1].set_xlabel('r (Å)', fontsize=font_size_label, fontweight='bold')
-    axs[0, 1].set_title('(b) RDF', fontsize=font_size_title, fontweight='bold')
+    axs[0, 1].set_title('RDF', fontsize=font_size_title)
     axs[0, 1].legend(fontsize=font_size_legend-1, loc='upper left', frameon=True, fancybox=True, ncol=2)
     axs[0, 1].tick_params(labelsize=font_size_tick)
     #axs[0, 1].grid(True, alpha=0.3, linestyle='--')
     
     # Lower row: Reference vs Optimized
     # Column 0: Power Spectrum
-    axs[1, 0].plot(p_ref_numpy, label='Reference', alpha=0.8, lw=1.0)
-    axs[1, 0].plot(p_opt_numpy, label='Optimized', alpha=0.8, lw=1.0)
+    axs[1, 0].plot(p_ref_plot, label='Reference', alpha=0.8, lw=1.0)
+    axs[1, 0].plot(p_opt_plot, label='Optimized', alpha=0.8, lw=1.0)
+    # Use a symmetric log scale to reveal small components while keeping the dominant first term
+    axs[1, 0].set_yscale('symlog', linthresh=1e-1)
     axs[1, 0].set_xlabel('Power Spectrum Index', fontsize=font_size_label)
     axs[1, 0].set_ylabel('$P_{nl}$', fontsize=font_size_label)
     #axs[1, 0].set_title('(c) Power Spectrum: Ref vs Opt', fontsize=font_size_title, fontweight='bold', loc='left')
@@ -462,7 +471,7 @@ def main(prototype='a-quartz'):
             axs[1, 1].plot(x_rdf_real, rdf_opt_real[pair_idx], 
                     label=f'{label} Opt', alpha=0.8, lw=1.0, linestyle='--', color=c_opt)
             axs[1, 1].set_xlabel('r (Å)', fontsize=font_size_label)
-            axs[1, 1].set_ylabel('RDF', fontsize=font_size_label)
+            axs[1, 1].set_ylabel('G(r)', fontsize=font_size_label)
     #axs[1, 1].set_title('(d) RDF: Ref vs Opt', fontsize=font_size_title, fontweight='bold', loc='left')
     #axs[1, 1].legend(fontsize=font_size_legend-1, loc='upper right', frameon=True, fancybox=True, ncol=2)
     axs[1, 1].tick_params(labelsize=font_size_tick)
@@ -473,18 +482,20 @@ def main(prototype='a-quartz'):
     #             fontsize=13, fontweight='bold', y=0.98)
     plt.tight_layout(rect=[0, 0, 1, 0.97])
     
-    fig_file = f'fig/{name}_reconstruction_plot.png'
+    fig_file = f'fig/{name}_{pert_str}.png'
     plt.savefig(fig_file, dpi=300)
     plt.close()
     print(f"  {fig_file}")
 
 
 if __name__ == '__main__':
-    set_global_seed(20)
+    set_global_seed(42)
     
     import argparse
     parser = argparse.ArgumentParser(description='Inverse Optimization of Crystal Structure using RECIPROCAL-space Descriptors')
     parser.add_argument('--prototype', type=str, default='a-quartz', help='Structure prototype (default: a-quartz)')
+    parser.add_argument('--d-lat', type=float, default=0.1, help='Lattice perturbation magnitude (relative)')
+    parser.add_argument('--d-coor', type=float, default=0.9, help='Coordinate perturbation magnitude (Å)')
     args = parser.parse_args()
 
-    main(prototype=args.prototype)
+    main(prototype=args.prototype, d_lat=args.d_lat, d_coor=args.d_coor)
