@@ -186,13 +186,13 @@ def chebyshev_basis(r, nmax=6, r_cut=0.24, normalize=True):
         # Chebyshev weight: 1/sqrt(1-x^2), avoiding singularities
         weights = 1.0 / torch.sqrt(torch.clamp(1 - x_vals**2, min=1e-10))
         weights = weights * dx
- 
+
         for n in range(nmax):
             # Compute norm with Chebyshev weight
             norm_sq = torch.sum(weights * basis[:, n] ** 2)
             if norm_sq > 1e-10:
                 basis[:, n] /= torch.sqrt(norm_sq)
- 
+
     return basis
 
 class RECP:
@@ -313,7 +313,7 @@ class RECP:
         Get the radial distribution function (RDF) from the d-spacing and values.
         """
         from scipy.ndimage import gaussian_filter1d
-        print("number of bins:", self.num_bins)
+        #print("number of bins:", self.num_bins)
         bins = np.linspace(0, self.dmax, self.num_bins)
         rdf, _ = np.histogram(ds, bins=bins, weights=vals)
         rdf = gaussian_filter1d(rdf, sigma=self.sigma)

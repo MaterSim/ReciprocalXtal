@@ -2,7 +2,17 @@
 
 # ReciprocalXtal
 
-This repository accompanies the paper  **“Crystal Representation in the Reciprocal Space”**.
+This repository accompanies the manuscript **[Crystal Representation in the Reciprocal Space](https://arxiv.org/abs/2601.17981)**.
+
+@misc{ridwan2026crystalrepresentationreciprocalspace,
+      title={Crystal Representation in the Reciprocal Space}, 
+      author={Osman Goni Ridwan and Hongfei Xue and Youxing Chen and Harish Cherukuri and Qiang Zhu},
+      year={2026},
+      eprint={2601.17981},
+      archivePrefix={arXiv},
+      primaryClass={cond-mat.mtrl-sci},
+      url={https://arxiv.org/abs/2601.17981}, 
+}
 
 It contains scripts used to generate the  figures and demonstrations in the manuscript, focusing on a rotation- and translation-invariant crystal representation built in reciprocal space.
 
