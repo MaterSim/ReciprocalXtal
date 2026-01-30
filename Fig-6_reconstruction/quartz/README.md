@@ -27,10 +27,20 @@ The objective is a weighted sum of descriptor RMSE and RDF RMSE. Optimization ru
 ## How to Run
 
 ```bash
+# Default: α-quartz with d_lat=0.1, d_coor=0.9 Å
 python reconstruct_quartz.py --prototype a-quartz
-# or
-python reconstruct_quartz.py --prototype b-quartz
+
+# β-quartz with custom perturbation
+python reconstruct_quartz.py --prototype b-quartz --d-lat 0.2 --d-coor 1.8
+
+# Custom perturbation parameters
+python reconstruct_quartz.py --prototype a-quartz --d-lat 0.15 --d-coor 1.2
 ```
+
+**Command-line options:**
+- `--prototype`: Structure prototype (`a-quartz` or `b-quartz`; default: `a-quartz`)
+- `--d-lat`: Lattice perturbation magnitude, relative (default: 0.1)
+- `--d-coor`: Coordinate perturbation magnitude in Å (default: 0.9)
 
 Outputs are written to `cifs/` (reference, perturbed, optimized CIFs) and `fig/` (comparison plot).
 
