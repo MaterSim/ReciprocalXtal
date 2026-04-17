@@ -1,0 +1,74 @@
+{
+  "source": "mp",
+  "n_references": 6,
+  "n_queries": 54,
+  "selection": {
+    "formulas": [
+      "C",
+      "SiO2",
+      "TiO2"
+    ],
+    "material_ids": [],
+    "max_per_formula": 2,
+    "max_total_structures": 6,
+    "max_sites": 40
+  },
+  "query_generation": {
+    "coord_noise": [
+      0.01,
+      0.02
+    ],
+    "lattice_noise": [
+      0.01
+    ],
+    "combined_noise": [
+      "0.02:0.01"
+    ],
+    "include_supercell": true,
+    "max_supercell_sites": 80,
+    "seed": 7
+  },
+  "reciprocal_settings": {
+    "dmax": 10.0,
+    "nmax": 10,
+    "lmax": 10,
+    "rbasis": "Bessel",
+    "normalize": false
+  },
+  "descriptor_build_seconds": {
+    "reference_total": 1.0347950831055641,
+    "query_total": 1.086170788272284,
+    "reference_mean": 0.1724658471842607,
+    "query_mean": 0.020114273856894148
+  },
+  "reciprocal": {
+    "method": "reciprocal_power_spectrum",
+    "n_queries": 54,
+    "top1_accuracy": 1.0,
+    "top5_accuracy": 1.0,
+    "mean_query_runtime_seconds": 1.6229177600945587e-05
+  },
+  "structurematcher": [
+    {
+      "setting": "strict",
+      "true_parent_match_rate": 1.0,
+      "total_false_positives": 0,
+      "total_false_negatives": 0,
+      "mean_query_runtime_seconds": 0.010371658903615619
+    },
+    {
+      "setting": "medium",
+      "true_parent_match_rate": 1.0,
+      "total_false_positives": 0,
+      "total_false_negatives": 0,
+      "mean_query_runtime_seconds": 0.007705954584741482
+    },
+    {
+      "setting": "loose",
+      "true_parent_match_rate": 1.0,
+      "total_false_positives": 21,
+      "total_false_negatives": 0,
+      "mean_query_runtime_seconds": 0.007123187499086338
+    }
+  ]
+}
