@@ -7,12 +7,13 @@ import os
 import re
 import sys
 import time
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
 
 import numpy as np
-from scipy.ndimage import gaussian_filter1d
+from scipy.stats import rankdata
 
 # Allow importing reciprocal.py from repository root.
 sys.path.append(str(Path(__file__).resolve().parents[2]))
@@ -23,11 +24,9 @@ DEFAULT_FORMULAS = ["C", "SiO2", "TiO2"]
 DEFAULT_COORD_NOISE = [0.01, 0.02]
 DEFAULT_LATTICE_NOISE = [0.01]
 DEFAULT_COMBINED_NOISE = ["0.02:0.01"]
-DEFAULT_G_SIGMAS = [0.03, 0.05, 0.10]
 DEFAULT_G_BIN_WIDTH = 0.02
 DEFAULT_ORIGIN_SHIFT = np.array([0.173, 0.257, 0.389], dtype=float)
 PRIMARY_POOL_SCOPE = "same_formula"
-ALL_REFERENCES_SCOPE = "all_references"
 
 
 @dataclass(frozen=True)
@@ -56,7 +55,6 @@ CURATED_PRESETS: Dict[str, dict] = {
         "include_supercell": True,
         "max_sites": 48,
         "max_supercell_sites": 96,
-        "g_sigmas": DEFAULT_G_SIGMAS,
     }
 }
 
@@ -123,10 +121,6 @@ def parse_combined_noise(values: Sequence[str]) -> List[Tuple[float, float]]:
         coord_str, lattice_str = value.split(":", 1)
         pairs.append((float(coord_str), float(lattice_str)))
     return pairs
-
-
-def format_sigma_tag(sigma: float) -> str:
-    return f"{sigma:.3f}".rstrip("0").rstrip(".").replace(".", "p")
 
 
 def spacegroup_info(structure: Any, symprec: float) -> Tuple[str, int | None]:
@@ -589,15 +583,9 @@ def compute_descriptors(
     *,
     normalize_reciprocal: bool,
     g_bin_width: float,
-    g_sigmas: Sequence[float],
 ) -> Tuple[Dict[str, Dict[str, np.ndarray]], Dict[str, Dict[str, float]]]:
     descriptors: Dict[str, Dict[str, np.ndarray]] = {"reciprocal_power_spectrum": {}, "raw_gd": {}}
     runtimes: Dict[str, Dict[str, float]] = {"reciprocal_power_spectrum": {}, "raw_gd": {}}
-
-    for sigma in g_sigmas:
-        method = f"smoothed_gd_sigma_{format_sigma_tag(sigma)}"
-        descriptors[method] = {}
-        runtimes[method] = {}
 
     for entry in entries:
         atoms = structure_to_ase_atoms(entry.structure)
@@ -615,159 +603,461 @@ def compute_descriptors(
         descriptors["raw_gd"][entry.entry_id] = raw_gd
         runtimes["raw_gd"][entry.entry_id] = time.perf_counter() - start
 
-        for sigma in g_sigmas:
-            method = f"smoothed_gd_sigma_{format_sigma_tag(sigma)}"
-            start = time.perf_counter()
-            sigma_bins = sigma / g_bin_width
-            smoothed = gaussian_filter1d(raw_gd, sigma=sigma_bins, mode="nearest")
-            descriptors[method][entry.entry_id] = smoothed.astype(float)
-            runtimes[method][entry.entry_id] = time.perf_counter() - start
-
     return descriptors, runtimes
+
+
+def l2_normalize(vector: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    array = np.asarray(vector, dtype=float)
+    norm = float(np.linalg.norm(array))
+    if norm <= eps:
+        return np.zeros_like(array, dtype=float)
+    return array / norm
+
+
+def apply_pnl_first_weight(vector: np.ndarray, pnl_first_weight: float) -> np.ndarray:
+    array = np.asarray(vector, dtype=float).copy()
+    if array.size > 0:
+        array[0] *= pnl_first_weight
+    return array
+
+
+def preprocess_continuous_descriptor(
+    vector: np.ndarray,
+    *,
+    method: str,
+    match_profile: str,
+    pnl_first_weight: float,
+) -> np.ndarray:
+    array = np.asarray(vector, dtype=float)
+
+    if match_profile == "shape":
+        if method == "reciprocal_power_spectrum":
+            # Compress the dynamic range so a few dominant low-order terms do not
+            # overwhelm the shape comparison.
+            array = np.log1p(np.maximum(array, 0.0))
+
+    if method == "reciprocal_power_spectrum":
+        array = apply_pnl_first_weight(array, pnl_first_weight)
+
+    if match_profile == "raw":
+        return array
+    if match_profile in {"normalized", "shape"}:
+        return l2_normalize(array)
+
+    raise ValueError(f"Unsupported continuous match profile: {match_profile}")
+
+
+def preprocess_descriptor_map(
+    descriptors: Dict[str, np.ndarray],
+    *,
+    method: str,
+    match_profile: str,
+    pnl_first_weight: float,
+) -> Dict[str, np.ndarray]:
+    return {
+        entry_id: preprocess_continuous_descriptor(
+            vector,
+            method=method,
+            match_profile=match_profile,
+            pnl_first_weight=pnl_first_weight,
+        )
+        for entry_id, vector in descriptors.items()
+    }
+
+
+def get_matcher_settings() -> List[MatcherSetting]:
+    return [
+        MatcherSetting("strict", ltol=0.1, stol=0.1, angle_tol=2.0),
+        MatcherSetting("medium", ltol=0.2, stol=0.3, angle_tol=5.0),
+        MatcherSetting("loose", ltol=0.3, stol=0.5, angle_tol=10.0),
+    ]
+
+
+def build_threshold_split_policy(
+    references: Sequence[BenchmarkEntry],
+    *,
+    seed: int,
+) -> dict:
+    formula_to_parent_ids: Dict[str, List[str]] = defaultdict(list)
+    for reference in references:
+        formula_to_parent_ids[reference.formula].append(reference.parent_id)
+
+    rng = np.random.default_rng(seed)
+    calibration_by_formula: Dict[str, List[str]] = {}
+    evaluation_by_formula: Dict[str, List[str]] = {}
+
+    for formula, parent_ids in sorted(formula_to_parent_ids.items()):
+        unique_parent_ids = sorted(set(parent_ids))
+        if len(unique_parent_ids) < 2:
+            raise RuntimeError(
+                "Threshold-based held-out evaluation requires at least two reference "
+                f"parents for each formula. Formula '{formula}' only has "
+                f"{len(unique_parent_ids)}."
+            )
+
+        shuffled = list(np.asarray(unique_parent_ids)[rng.permutation(len(unique_parent_ids))])
+        n_eval = max(1, len(unique_parent_ids) // 2)
+        if len(unique_parent_ids) - n_eval < 1:
+            n_eval = len(unique_parent_ids) - 1
+
+        evaluation_ids = sorted(shuffled[:n_eval])
+        calibration_ids = sorted(shuffled[n_eval:])
+        calibration_by_formula[formula] = calibration_ids
+        evaluation_by_formula[formula] = evaluation_ids
+
+    strict_quarantine_feasible = any(
+        len(calibration_ids) > 1 for calibration_ids in calibration_by_formula.values()
+    )
+
+    return {
+        "mode": (
+            "held_out_query_parents_with_reference_quarantine"
+            if strict_quarantine_feasible
+            else "held_out_query_parents"
+        ),
+        "seed": seed,
+        "calibration_parent_ids_by_formula": calibration_by_formula,
+        "evaluation_parent_ids_by_formula": evaluation_by_formula,
+        "fallback_reason": (
+            None
+            if strict_quarantine_feasible
+            else (
+                "Strict reference quarantine would leave the calibration split with no "
+                "cross-parent same-formula negatives. Falling back to a held-out query-parent "
+                "split so thresholds remain fit-able on two-reference-per-formula datasets."
+            )
+        ),
+    }
+
+
+def assign_threshold_split(
+    *,
+    query_parent_id: str,
+    reference_parent_id: str,
+    formula: str,
+    split_policy: dict,
+) -> str | None:
+    calibration_ids = set(split_policy["calibration_parent_ids_by_formula"][formula])
+    evaluation_ids = set(split_policy["evaluation_parent_ids_by_formula"][formula])
+
+    if query_parent_id in evaluation_ids:
+        return "evaluation"
+    if query_parent_id in calibration_ids:
+        if split_policy["mode"] == "held_out_query_parents_with_reference_quarantine":
+            return "calibration" if reference_parent_id in calibration_ids else None
+        return "calibration"
+    return None
+
+
+def safe_divide(numerator: float, denominator: float) -> float:
+    if denominator == 0:
+        return 0.0
+    return float(numerator / denominator)
+
+
+def compute_binary_metrics(
+    labels: Sequence[int],
+    predictions: Sequence[int],
+) -> dict:
+    label_array = np.asarray(labels, dtype=int)
+    prediction_array = np.asarray(predictions, dtype=int)
+
+    tp = int(np.sum((label_array == 1) & (prediction_array == 1)))
+    fp = int(np.sum((label_array == 0) & (prediction_array == 1)))
+    tn = int(np.sum((label_array == 0) & (prediction_array == 0)))
+    fn = int(np.sum((label_array == 1) & (prediction_array == 0)))
+
+    precision = safe_divide(tp, tp + fp)
+    recall = safe_divide(tp, tp + fn)
+    specificity = safe_divide(tn, tn + fp)
+    f1 = safe_divide(2.0 * precision * recall, precision + recall) if (precision + recall) > 0 else 0.0
+
+    return {
+        "tp": tp,
+        "fp": fp,
+        "tn": tn,
+        "fn": fn,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "balanced_accuracy": 0.5 * (recall + specificity),
+        "accuracy": safe_divide(tp + tn, len(label_array)),
+        "positive_count": int(np.sum(label_array == 1)),
+        "negative_count": int(np.sum(label_array == 0)),
+    }
+
+
+def compute_distance_roc_auc(
+    labels: Sequence[int],
+    distances: Sequence[float],
+) -> float | None:
+    label_array = np.asarray(labels, dtype=int)
+    distance_array = np.asarray(distances, dtype=float)
+    n_pos = int(np.sum(label_array == 1))
+    n_neg = int(np.sum(label_array == 0))
+    if n_pos == 0 or n_neg == 0:
+        return None
+
+    # Lower distance means more likely positive, so rank by negative distance.
+    ranks = rankdata(-distance_array, method="average")
+    positive_ranks = float(np.sum(ranks[label_array == 1]))
+    auc = (positive_ranks - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
+    return float(auc)
+
+
+def fit_distance_threshold(
+    distances: Sequence[float],
+    labels: Sequence[int],
+) -> dict:
+    distance_array = np.asarray(distances, dtype=float)
+    label_array = np.asarray(labels, dtype=int)
+    if len(distance_array) == 0:
+        raise RuntimeError("Cannot fit a threshold without calibration pairs.")
+
+    unique_distances = np.sort(np.unique(distance_array))
+    epsilon = max(1e-12, np.finfo(float).eps * max(1.0, float(unique_distances[0])))
+    candidate_thresholds = np.concatenate(([unique_distances[0] - epsilon], unique_distances))
+
+    best_result: dict | None = None
+    best_key: tuple[float, float, float] | None = None
+
+    for threshold in candidate_thresholds:
+        predictions = (distance_array <= threshold).astype(int)
+        metrics = compute_binary_metrics(label_array, predictions)
+        key = (metrics["f1"], metrics["precision"], -float(threshold))
+        if best_key is None or key > best_key:
+            best_key = key
+            best_result = {
+                "threshold": float(threshold),
+                "metrics": metrics,
+                "roc_auc": compute_distance_roc_auc(label_array, distance_array),
+            }
+
+    if best_result is None:
+        raise RuntimeError("Threshold fitting did not produce any candidate.")
+    return best_result
+
+
+def classification_tag(label: int, prediction: int) -> str:
+    if label == 1 and prediction == 1:
+        return "TP"
+    if label == 0 and prediction == 1:
+        return "FP"
+    if label == 0 and prediction == 0:
+        return "TN"
+    return "FN"
+
+
+def summarize_split_evaluation(
+    distances: Sequence[float],
+    labels: Sequence[int],
+    threshold: float,
+) -> dict:
+    distance_array = np.asarray(distances, dtype=float)
+    label_array = np.asarray(labels, dtype=int)
+    predictions = (distance_array <= threshold).astype(int)
+    metrics = compute_binary_metrics(label_array, predictions)
+    metrics["roc_auc"] = compute_distance_roc_auc(label_array, distance_array)
+    return metrics
+
+
+def evaluate_threshold_pairwise_matching(
+    *,
+    descriptor_pair_rows_by_method: Dict[str, List[dict]],
+    sm_pair_rows: Sequence[dict],
+    references: Sequence[BenchmarkEntry],
+    split_policy: dict,
+    match_profile: str,
+    pnl_first_weight: float,
+) -> tuple[List[dict], List[dict]]:
+    reference_formula_by_parent = {reference.parent_id: reference.formula for reference in references}
+    sm_pair_lookup: Dict[tuple[str, str, str], dict] = {
+        (row["setting"], row["query_id"], row["reference_id"]): row for row in sm_pair_rows
+    }
+
+    prediction_rows: List[dict] = []
+    summary_rows: List[dict] = []
+
+    for method_name, descriptor_pair_rows in descriptor_pair_rows_by_method.items():
+        for setting in get_matcher_settings():
+            calibration_records: List[dict] = []
+            evaluation_records: List[dict] = []
+
+            for pair_row in descriptor_pair_rows:
+                sm_row = sm_pair_lookup[(setting.name, pair_row["query_id"], pair_row["reference_id"])]
+                formula = reference_formula_by_parent[pair_row["reference_parent_id"]]
+                split = assign_threshold_split(
+                    query_parent_id=pair_row["query_parent_id"],
+                    reference_parent_id=pair_row["reference_parent_id"],
+                    formula=formula,
+                    split_policy=split_policy,
+                )
+                if split is None:
+                    continue
+
+                record = {
+                    "split": split,
+                    "method": method_name,
+                    "continuous_match_profile": match_profile,
+                    "structurematcher_setting": setting.name,
+                    "query_id": pair_row["query_id"],
+                    "query_parent_id": pair_row["query_parent_id"],
+                    "query_display_name": pair_row["query_display_name"],
+                    "query_family_name": pair_row["query_family_name"],
+                    "query_variant": pair_row["query_variant"],
+                    "query_variant_family": pair_row["query_variant_family"],
+                    "reference_id": pair_row["reference_id"],
+                    "reference_parent_id": pair_row["reference_parent_id"],
+                    "reference_display_name": pair_row["reference_display_name"],
+                    "reference_family_name": pair_row["reference_family_name"],
+                    "reference_variant": pair_row["reference_variant"],
+                    "formula": formula,
+                    "distance": float(pair_row["distance"]),
+                    "structurematcher_label": int(sm_row["is_match"]),
+                    "descriptor_pair_runtime_seconds": float(pair_row["pair_runtime_seconds"]),
+                    "structurematcher_pair_runtime_seconds": float(sm_row["pair_runtime_seconds"]),
+                }
+
+                if split == "calibration":
+                    calibration_records.append(record)
+                else:
+                    evaluation_records.append(record)
+
+            if not calibration_records:
+                raise RuntimeError(
+                    f"No calibration pairs were available for method '{method_name}' and setting '{setting.name}'."
+                )
+            if not evaluation_records:
+                raise RuntimeError(
+                    f"No evaluation pairs were available for method '{method_name}' and setting '{setting.name}'."
+                )
+
+            fitted = fit_distance_threshold(
+                [record["distance"] for record in calibration_records],
+                [record["structurematcher_label"] for record in calibration_records],
+            )
+            threshold = fitted["threshold"]
+            calibration_metrics = fitted["metrics"]
+            evaluation_metrics = summarize_split_evaluation(
+                [record["distance"] for record in evaluation_records],
+                [record["structurematcher_label"] for record in evaluation_records],
+                threshold,
+            )
+
+            for record in calibration_records + evaluation_records:
+                prediction = int(record["distance"] <= threshold)
+                prediction_rows.append(
+                    {
+                        **record,
+                        "pnl_first_weight": pnl_first_weight,
+                        "threshold": threshold,
+                        "predicted_match": prediction,
+                        "classification_tag": classification_tag(
+                            record["structurematcher_label"],
+                            prediction,
+                        ),
+                    }
+                )
+
+            summary_rows.append(
+                {
+                    "method": method_name,
+                    "continuous_match_profile": match_profile,
+                    "pnl_first_weight": pnl_first_weight,
+                    "structurematcher_setting": setting.name,
+                    "threshold": threshold,
+                    "calibration_pairs": len(calibration_records),
+                    "calibration_positives": calibration_metrics["positive_count"],
+                    "calibration_negatives": calibration_metrics["negative_count"],
+                    "calibration_precision": calibration_metrics["precision"],
+                    "calibration_recall": calibration_metrics["recall"],
+                    "calibration_f1": calibration_metrics["f1"],
+                    "calibration_balanced_accuracy": calibration_metrics["balanced_accuracy"],
+                    "calibration_roc_auc": fitted["roc_auc"],
+                    "evaluation_pairs": len(evaluation_records),
+                    "evaluation_positives": evaluation_metrics["positive_count"],
+                    "evaluation_negatives": evaluation_metrics["negative_count"],
+                    "evaluation_tp": evaluation_metrics["tp"],
+                    "evaluation_fp": evaluation_metrics["fp"],
+                    "evaluation_tn": evaluation_metrics["tn"],
+                    "evaluation_fn": evaluation_metrics["fn"],
+                    "evaluation_precision": evaluation_metrics["precision"],
+                    "evaluation_recall": evaluation_metrics["recall"],
+                    "evaluation_f1": evaluation_metrics["f1"],
+                    "evaluation_balanced_accuracy": evaluation_metrics["balanced_accuracy"],
+                    "evaluation_roc_auc": evaluation_metrics["roc_auc"],
+                    "descriptor_mean_pair_runtime_seconds": float(
+                        np.mean([record["descriptor_pair_runtime_seconds"] for record in evaluation_records])
+                    ),
+                    "structurematcher_mean_pair_runtime_seconds": float(
+                        np.mean([record["structurematcher_pair_runtime_seconds"] for record in evaluation_records])
+                    ),
+                }
+            )
+
+    return prediction_rows, summary_rows
 
 
 def select_reference_pool(
     query: BenchmarkEntry,
     references: Sequence[BenchmarkEntry],
-    *,
-    pool_scope: str,
 ) -> List[BenchmarkEntry]:
-    if pool_scope == PRIMARY_POOL_SCOPE:
-        pool = [ref for ref in references if ref.formula == query.formula]
-    elif pool_scope == ALL_REFERENCES_SCOPE:
-        pool = list(references)
-    else:
-        raise ValueError(f"Unsupported pool scope: {pool_scope}")
-
+    pool = [ref for ref in references if ref.formula == query.formula]
     if not pool:
         raise RuntimeError(
-            f"No reference structures available for query {query.entry_id} under pool scope '{pool_scope}'."
+            f"No same-formula reference structures available for query {query.entry_id}."
         )
     return pool
 
 
-def run_continuous_retrieval(
+def build_descriptor_pair_rows(
     method: str,
     references: Sequence[BenchmarkEntry],
     queries: Sequence[BenchmarkEntry],
     ref_desc: Dict[str, np.ndarray],
     query_desc: Dict[str, np.ndarray],
-    *,
-    pool_scope: str,
-) -> Tuple[List[dict], List[dict], dict]:
+) -> List[dict]:
     pair_rows: List[dict] = []
-    query_rows: List[dict] = []
-    n_top1 = 0
-    n_top5 = 0
-    total_runtime = 0.0
-    same_distances: List[float] = []
-    different_distances: List[float] = []
 
     for query in queries:
-        query_start = time.perf_counter()
-        distances: List[Tuple[float, BenchmarkEntry]] = []
         qv = query_desc[query.entry_id]
-        candidate_refs = select_reference_pool(query, references, pool_scope=pool_scope)
+        candidate_refs = select_reference_pool(query, references)
 
         for ref in candidate_refs:
+            pair_start = time.perf_counter()
             distance = float(np.linalg.norm(qv - ref_desc[ref.entry_id]))
-            distances.append((distance, ref))
+            pair_runtime = time.perf_counter() - pair_start
             is_true_parent = int(query.parent_id == ref.parent_id)
             pair_rows.append(
                 {
                     "method": method,
-                    "pool_scope": pool_scope,
                     "query_id": query.entry_id,
                     "query_parent_id": query.parent_id,
+                    "query_formula": query.formula,
                     "query_display_name": query.display_name,
                     "query_family_name": query.family_name,
                     "query_variant": query.variant,
                     "query_variant_family": query.variant_family,
                     "reference_id": ref.entry_id,
                     "reference_parent_id": ref.parent_id,
+                    "reference_formula": ref.formula,
                     "reference_display_name": ref.display_name,
                     "reference_family_name": ref.family_name,
                     "reference_variant": ref.variant,
                     "distance": distance,
                     "is_true_parent": is_true_parent,
+                    "pair_runtime_seconds": pair_runtime,
                 }
             )
-            if is_true_parent:
-                same_distances.append(distance)
-            else:
-                different_distances.append(distance)
-
-        distances.sort(key=lambda item: item[0])
-        query_runtime = time.perf_counter() - query_start
-        total_runtime += query_runtime
-
-        true_parent_rank = None
-        nearest_wrong_distance = None
-        for idx, (distance, ref) in enumerate(distances, start=1):
-            if ref.parent_id == query.parent_id and true_parent_rank is None:
-                true_parent_rank = idx
-            if ref.parent_id != query.parent_id and nearest_wrong_distance is None:
-                nearest_wrong_distance = distance
-            if true_parent_rank is not None and nearest_wrong_distance is not None:
-                break
-
-        top_k = min(5, len(distances))
-        top1_distance, top1_ref = distances[0]
-        top1_correct = int(top1_ref.parent_id == query.parent_id)
-        top5_correct = int(any(ref.parent_id == query.parent_id for _, ref in distances[:top_k]))
-        n_top1 += top1_correct
-        n_top5 += top5_correct
-
-        query_rows.append(
-            {
-                "method": method,
-                "pool_scope": pool_scope,
-                "query_id": query.entry_id,
-                "query_parent_id": query.parent_id,
-                "query_display_name": query.display_name,
-                "query_family_name": query.family_name,
-                "query_variant": query.variant,
-                "query_variant_family": query.variant_family,
-                "top1_reference_id": top1_ref.entry_id,
-                "top1_reference_parent_id": top1_ref.parent_id,
-                "top1_reference_display_name": top1_ref.display_name,
-                "top1_distance": top1_distance,
-                "nearest_wrong_distance": nearest_wrong_distance,
-                "true_parent_rank": true_parent_rank,
-                "candidate_count": len(candidate_refs),
-                "correct_top1": top1_correct,
-                "correct_top5": top5_correct,
-                "query_runtime_seconds": query_runtime,
-            }
-        )
-
-    summary = {
-        "method": method,
-        "pool_scope": pool_scope,
-        "n_queries": len(queries),
-        "top1_accuracy": n_top1 / max(len(queries), 1),
-        "top5_accuracy": n_top5 / max(len(queries), 1),
-        "mean_query_runtime_seconds": total_runtime / max(len(queries), 1),
-        "same_distance_mean": float(np.mean(same_distances)) if same_distances else None,
-        "different_distance_mean": float(np.mean(different_distances)) if different_distances else None,
-        "same_distance_min": float(np.min(same_distances)) if same_distances else None,
-        "different_distance_min": float(np.min(different_distances)) if different_distances else None,
-    }
-    return pair_rows, query_rows, summary
+    return pair_rows
 
 
 def run_structure_matcher(
     references: Sequence[BenchmarkEntry],
     queries: Sequence[BenchmarkEntry],
-    *,
-    pool_scope: str,
 ) -> Tuple[List[dict], List[dict], List[dict]]:
     StructureMatcher = _structure_matcher_cls()
-    settings = [
-        MatcherSetting("strict", ltol=0.1, stol=0.1, angle_tol=2.0),
-        MatcherSetting("medium", ltol=0.2, stol=0.3, angle_tol=5.0),
-        MatcherSetting("loose", ltol=0.3, stol=0.5, angle_tol=10.0),
-    ]
+    settings = get_matcher_settings()
 
     pair_rows: List[dict] = []
     query_summary_rows: List[dict] = []
@@ -794,7 +1084,7 @@ def run_structure_matcher(
             matched_reference_ids: List[str] = []
             false_positives = 0
             has_true_match = False
-            candidate_refs = select_reference_pool(query, references, pool_scope=pool_scope)
+            candidate_refs = select_reference_pool(query, references)
 
             for ref in candidate_refs:
                 pair_start = time.perf_counter()
@@ -812,15 +1102,16 @@ def run_structure_matcher(
                 pair_rows.append(
                     {
                         "setting": setting.name,
-                        "pool_scope": pool_scope,
                         "query_id": query.entry_id,
                         "query_parent_id": query.parent_id,
+                        "query_formula": query.formula,
                         "query_display_name": query.display_name,
                         "query_family_name": query.family_name,
                         "query_variant": query.variant,
                         "query_variant_family": query.variant_family,
                         "reference_id": ref.entry_id,
                         "reference_parent_id": ref.parent_id,
+                        "reference_formula": ref.formula,
                         "reference_display_name": ref.display_name,
                         "reference_family_name": ref.family_name,
                         "reference_variant": ref.variant,
@@ -840,7 +1131,6 @@ def run_structure_matcher(
             query_summary_rows.append(
                 {
                     "setting": setting.name,
-                    "pool_scope": pool_scope,
                     "query_id": query.entry_id,
                     "query_parent_id": query.parent_id,
                     "query_display_name": query.display_name,
@@ -858,12 +1148,11 @@ def run_structure_matcher(
             )
 
         aggregate_rows.append(
-            {
-                "setting": setting.name,
-                "pool_scope": pool_scope,
-                "true_parent_match_rate": n_true_parent_matched / max(len(queries), 1),
-                "total_false_positives": total_false_positives,
-                "total_false_negatives": total_false_negatives,
+                {
+                    "setting": setting.name,
+                    "true_parent_match_rate": n_true_parent_matched / max(len(queries), 1),
+                    "total_false_positives": total_false_positives,
+                    "total_false_negatives": total_false_negatives,
                 "mean_query_runtime_seconds": total_query_runtime / max(len(queries), 1),
             }
         )
@@ -896,8 +1185,6 @@ def apply_preset_defaults(args: argparse.Namespace) -> tuple[argparse.Namespace,
         args.max_sites = int(preset["max_sites"])
     if args.max_supercell_sites == 80:
         args.max_supercell_sites = int(preset["max_supercell_sites"])
-    if args.g_sigma == DEFAULT_G_SIGMAS:
-        args.g_sigma = list(preset["g_sigmas"])
     if args.skip_supercell and preset["include_supercell"]:
         pass
     return args, list(preset["references"])
@@ -906,7 +1193,7 @@ def apply_preset_defaults(args: argparse.Namespace) -> tuple[argparse.Namespace,
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Benchmark reciprocal power spectrum P_nl, raw G(d), smoothed G(d), "
+            "Benchmark reciprocal power spectrum P_nl, raw G(d), "
             "and pymatgen StructureMatcher on small MP or local crystal datasets."
         )
     )
@@ -973,13 +1260,32 @@ def main() -> None:
     )
     parser.add_argument("--normalize-reciprocal", action="store_true")
     parser.add_argument("--g-bin-width", type=float, default=DEFAULT_G_BIN_WIDTH)
-    parser.add_argument("--g-sigma", type=float, nargs="*", default=DEFAULT_G_SIGMAS)
     parser.add_argument(
-        "--include-cross-composition",
-        action="store_true",
-        help="Also report mixed-composition retrieval across the full reference set as a secondary screen.",
+        "--continuous-match-profile",
+        type=str,
+        default="normalized",
+        choices=["raw", "normalized", "shape"],
+        help=(
+            "How to post-process continuous descriptors before L2 pairwise "
+            "comparison. 'raw' reproduces the old plain-L2 benchmark. "
+            "'normalized' applies per-vector L2 normalization and is the "
+            "default fair comparison. 'shape' applies log1p + L2 "
+            "normalization for P_nl, and L2 normalization for G(d)."
+        ),
+    )
+    parser.add_argument(
+        "--pnl-first-weight",
+        type=float,
+        default=0.1,
+        help=(
+            "Weight applied to the first reciprocal power-spectrum component "
+            "before continuous matching. Use 1.0 to recover the unweighted "
+            "behavior."
+        ),
     )
     args = parser.parse_args()
+    if args.pnl_first_weight < 0.0:
+        raise ValueError("--pnl-first-weight must be non-negative.")
 
     args, reference_specs = apply_preset_defaults(args)
     rng = np.random.default_rng(args.seed)
@@ -1023,46 +1329,28 @@ def main() -> None:
         recp,
         normalize_reciprocal=args.normalize_reciprocal,
         g_bin_width=args.g_bin_width,
-        g_sigmas=args.g_sigma,
     )
 
-    continuous_summaries: Dict[str, dict] = {}
-    cross_composition_summaries: Dict[str, dict] = {}
     descriptor_build_summary: Dict[str, dict] = {}
+    descriptor_pair_rows_by_method: Dict[str, List[dict]] = {}
 
     for method_name, method_desc in descriptors.items():
-        ref_desc = {entry.entry_id: method_desc[entry.entry_id] for entry in references}
-        query_desc = {entry.entry_id: method_desc[entry.entry_id] for entry in queries}
-        pair_rows, query_rows, summary = run_continuous_retrieval(
+        processed_desc = preprocess_descriptor_map(
+            method_desc,
+            method=method_name,
+            match_profile=args.continuous_match_profile,
+            pnl_first_weight=args.pnl_first_weight,
+        )
+        ref_desc = {entry.entry_id: processed_desc[entry.entry_id] for entry in references}
+        query_desc = {entry.entry_id: processed_desc[entry.entry_id] for entry in queries}
+        pair_rows = build_descriptor_pair_rows(
             method_name,
             references,
             queries,
             ref_desc,
             query_desc,
-            pool_scope=PRIMARY_POOL_SCOPE,
         )
-        write_csv(args.output_dir / f"{method_name}_pairwise.csv", pair_rows)
-        write_csv(args.output_dir / f"{method_name}_retrieval.csv", query_rows)
-        continuous_summaries[method_name] = summary
-
-        if args.include_cross_composition:
-            cross_pair_rows, cross_query_rows, cross_summary = run_continuous_retrieval(
-                method_name,
-                references,
-                queries,
-                ref_desc,
-                query_desc,
-                pool_scope=ALL_REFERENCES_SCOPE,
-            )
-            write_csv(
-                args.output_dir / f"{method_name}_{ALL_REFERENCES_SCOPE}_pairwise.csv",
-                cross_pair_rows,
-            )
-            write_csv(
-                args.output_dir / f"{method_name}_{ALL_REFERENCES_SCOPE}_retrieval.csv",
-                cross_query_rows,
-            )
-            cross_composition_summaries[method_name] = cross_summary
+        descriptor_pair_rows_by_method[method_name] = pair_rows
 
         times = build_times[method_name]
         descriptor_build_summary[method_name] = {
@@ -1075,11 +1363,24 @@ def main() -> None:
     sm_pair_rows, sm_query_rows, sm_aggregate_rows = run_structure_matcher(
         references,
         queries,
-        pool_scope=PRIMARY_POOL_SCOPE,
     )
     write_csv(args.output_dir / "structurematcher_pairs.csv", sm_pair_rows)
     write_csv(args.output_dir / "structurematcher_query_summary.csv", sm_query_rows)
     write_csv(args.output_dir / "structurematcher_aggregate.csv", sm_aggregate_rows)
+
+    threshold_split_policy = build_threshold_split_policy(references, seed=args.seed)
+    threshold_prediction_rows, threshold_summary_rows = evaluate_threshold_pairwise_matching(
+        descriptor_pair_rows_by_method=descriptor_pair_rows_by_method,
+        sm_pair_rows=sm_pair_rows,
+        references=references,
+        split_policy=threshold_split_policy,
+        match_profile=args.continuous_match_profile,
+        pnl_first_weight=args.pnl_first_weight,
+    )
+    write_csv(args.output_dir / "pairwise_threshold_predictions.csv", threshold_prediction_rows)
+    write_csv(args.output_dir / "pairwise_threshold_summary.csv", threshold_summary_rows)
+
+    summary_formulas = list(args.formula) if not args.material_id and not reference_specs else []
 
     summary = {
         "source": args.source,
@@ -1087,7 +1388,7 @@ def main() -> None:
         "n_references": len(references),
         "n_queries": len(queries),
         "selection": {
-            "formulas": args.formula,
+            "formulas": summary_formulas,
             "material_ids": args.material_id,
             "curated_reference_ids": [spec.material_id for spec in reference_specs],
             "curated_reference_labels": [spec.display_name for spec in reference_specs],
@@ -1110,13 +1411,15 @@ def main() -> None:
             "rbasis": args.rbasis,
             "normalize_reciprocal": args.normalize_reciprocal,
             "g_bin_width": args.g_bin_width,
-            "g_sigma": args.g_sigma,
+            "continuous_match_profile": args.continuous_match_profile,
+            "pnl_first_weight": args.pnl_first_weight,
             "primary_pool_scope": PRIMARY_POOL_SCOPE,
-            "include_cross_composition": args.include_cross_composition,
         },
         "descriptor_build_seconds": descriptor_build_summary,
-        "continuous_methods": continuous_summaries,
-        "cross_composition_continuous_methods": cross_composition_summaries,
+        "threshold_pairwise": {
+            "split_policy": threshold_split_policy,
+            "summary_rows": threshold_summary_rows,
+        },
         "structurematcher": sm_aggregate_rows,
     }
 
@@ -1131,17 +1434,15 @@ def main() -> None:
     print(f"References:  {len(references)}")
     print(f"Queries:     {len(queries)}")
     print(f"Primary pool: {PRIMARY_POOL_SCOPE}")
-    for method_name, method_summary in continuous_summaries.items():
+    print(f"Continuous match profile: {args.continuous_match_profile}")
+    print(f"P_nl first-component weight: {args.pnl_first_weight}")
+    print("Primary threshold benchmark:")
+    for row in threshold_summary_rows:
         print(
-            f"{method_name} top-1/top-5: "
-            f"{method_summary['top1_accuracy']:.4f}/{method_summary['top5_accuracy']:.4f}"
+            f"  {row['method']} vs SM-{row['structurematcher_setting']}: "
+            f"tau={row['threshold']:.6g}, eval F1={row['evaluation_f1']:.4f}, "
+            f"precision={row['evaluation_precision']:.4f}, recall={row['evaluation_recall']:.4f}"
         )
-    if args.include_cross_composition:
-        for method_name, method_summary in cross_composition_summaries.items():
-            print(
-                f"{method_name} ({ALL_REFERENCES_SCOPE}) top-1/top-5: "
-                f"{method_summary['top1_accuracy']:.4f}/{method_summary['top5_accuracy']:.4f}"
-            )
     for row in sm_aggregate_rows:
         print(
             f"StructureMatcher {row['setting']} true-parent match rate: "

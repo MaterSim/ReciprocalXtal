@@ -1,4 +1,0 @@
-setting,pool_scope,true_parent_match_rate,total_false_positives,total_false_negatives,mean_query_runtime_seconds
-strict,same_formula,0.9107142857142857,0,10,0.08678572801935454
-medium,same_formula,1.0,0,0,0.07628691926324141
-loose,same_formula,1.0,0,0,0.13826436231257894

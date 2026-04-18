@@ -1,4 +1,0 @@
-setting,true_parent_match_rate,total_false_positives,total_false_negatives,mean_query_runtime_seconds
-strict,1.0,0,0,0.010371658903615619
-medium,1.0,0,0,0.007705954584741482
-loose,1.0,21,0,0.007123187499086338
