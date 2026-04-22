@@ -22,11 +22,19 @@ from reciprocal import RECP  # noqa: E402
 
 DEFAULT_FORMULAS = ["C", "SiO2", "TiO2"]
 DEFAULT_COORD_NOISE = [0.01, 0.02]
-DEFAULT_LATTICE_NOISE = [0.01]
-DEFAULT_COMBINED_NOISE = ["0.02:0.01"]
+DEFAULT_LATTICE_NOISE = [0.2]
 DEFAULT_G_BIN_WIDTH = 0.02
 DEFAULT_ORIGIN_SHIFT = np.array([0.173, 0.257, 0.389], dtype=float)
 PRIMARY_POOL_SCOPE = "same_formula"
+CELL_SIZE_BUCKETS: Dict[str, dict] = {
+    "small": {"min_sites": 1, "max_sites": 19},
+    "medium": {"min_sites": 20, "max_sites": 50},
+    "large": {"min_sites": 51, "max_sites": None},
+}
+
+
+def progress(message: str) -> None:
+    print(f"[{time.strftime('%H:%M:%S')}] {message}", flush=True)
 
 
 @dataclass(frozen=True)
@@ -51,7 +59,6 @@ CURATED_PRESETS: Dict[str, dict] = {
         ],
         "coord_noise": [0.02, 0.05, 0.10],
         "lattice_noise": [0.01, 0.02, 0.05],
-        "combined_noise": ["0.02:0.01", "0.05:0.02", "0.10:0.05"],
         "include_supercell": True,
         "max_sites": 48,
         "max_supercell_sites": 96,
@@ -111,16 +118,26 @@ def sanitize_token(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
 
 
-def parse_combined_noise(values: Sequence[str]) -> List[Tuple[float, float]]:
-    pairs: List[Tuple[float, float]] = []
-    for value in values:
-        if ":" not in value:
-            raise ValueError(
-                f"Invalid combined noise specifier '{value}'. Use '<coord_A>:<lattice_fraction>'."
-            )
-        coord_str, lattice_str = value.split(":", 1)
-        pairs.append((float(coord_str), float(lattice_str)))
-    return pairs
+def build_combined_noise_values(
+    coord_noise_levels: Sequence[float],
+    lattice_noise_levels: Sequence[float],
+) -> List[str]:
+    return [
+        f"{float(coord_noise):g}:{float(lattice_noise):g}"
+        for coord_noise in coord_noise_levels
+        for lattice_noise in lattice_noise_levels
+    ]
+
+
+def build_combined_noise_levels(
+    coord_noise_levels: Sequence[float],
+    lattice_noise_levels: Sequence[float],
+) -> List[Tuple[float, float]]:
+    return [
+        (float(coord_noise), float(lattice_noise))
+        for coord_noise in coord_noise_levels
+        for lattice_noise in lattice_noise_levels
+    ]
 
 
 def spacegroup_info(structure: Any, symprec: float) -> Tuple[str, int | None]:
@@ -286,11 +303,22 @@ def fetch_mp_references(
     reference_specs: Sequence[ReferenceSpec],
     max_per_formula: int,
     max_total_structures: int,
-    max_sites: int,
+    min_sites: int | None,
+    max_sites: int | None,
     symprec: float,
 ) -> List[BenchmarkEntry]:
     MPRester = _mp_rester_cls()
     references: List[BenchmarkEntry] = []
+
+    effective_min_sites = 0 if min_sites is None else int(min_sites)
+
+    def within_site_window(structure: Any) -> bool:
+        nsites = len(structure)
+        if nsites < effective_min_sites:
+            return False
+        if max_sites is not None and nsites > max_sites:
+            return False
+        return True
 
     with MPRester(api_key) as rester:
         if reference_specs:
@@ -299,9 +327,11 @@ def fetch_mp_references(
                     rester.get_structure_by_material_id(spec.material_id),
                     symprec=symprec,
                 )
-                if len(structure) > max_sites:
+                if not within_site_window(structure):
                     raise RuntimeError(
-                        f"Curated reference {spec.material_id} exceeds --max-sites={max_sites}."
+                        "Curated reference "
+                        f"{spec.material_id} does not satisfy the site-count filter "
+                        f"({effective_min_sites} <= nsites <= {max_sites})."
                     )
                 references.append(
                     make_entry(
@@ -325,7 +355,7 @@ def fetch_mp_references(
                     rester.get_structure_by_material_id(material_id),
                     symprec=symprec,
                 )
-                if len(structure) > max_sites:
+                if not within_site_window(structure):
                     continue
                 formula = structure.composition.reduced_formula
                 references.append(
@@ -357,7 +387,7 @@ def fetch_mp_references(
                     rester.get_structure_by_material_id(material_id),
                     symprec=symprec,
                 )
-                if len(structure) > max_sites:
+                if not within_site_window(structure):
                     continue
                 references.append(
                     make_entry(
@@ -380,9 +410,32 @@ def fetch_mp_references(
     if not references:
         raise RuntimeError(
             "No Materials Project reference structures were selected. "
-            "Try relaxing --max-sites or passing explicit --material-id values."
+            "Try relaxing the site-count filter or passing explicit --material-id values."
         )
     return references
+
+
+def filter_formulas_with_min_parents(
+    references: Sequence[BenchmarkEntry],
+    *,
+    min_unique_parents: int,
+) -> List[BenchmarkEntry]:
+    formula_to_parent_ids: Dict[str, set[str]] = defaultdict(set)
+    for reference in references:
+        formula_to_parent_ids[reference.formula].add(reference.parent_id)
+
+    allowed_formulas = {
+        formula
+        for formula, parent_ids in formula_to_parent_ids.items()
+        if len(parent_ids) >= min_unique_parents
+    }
+    filtered = [reference for reference in references if reference.formula in allowed_formulas]
+    if not filtered:
+        raise RuntimeError(
+            "No formula retained enough polymorph parents for held-out evaluation. "
+            f"Need at least {min_unique_parents} parent structures per formula."
+        )
+    return filtered
 
 
 def make_conventional_structure(structure: Any, symprec: float) -> Any | None:
@@ -1179,15 +1232,22 @@ def apply_preset_defaults(args: argparse.Namespace) -> tuple[argparse.Namespace,
         args.coord_noise = list(preset["coord_noise"])
     if args.lattice_noise == DEFAULT_LATTICE_NOISE:
         args.lattice_noise = list(preset["lattice_noise"])
-    if args.combined_noise == DEFAULT_COMBINED_NOISE:
-        args.combined_noise = list(preset["combined_noise"])
-    if args.max_sites == 40:
+    if args.max_sites is None:
         args.max_sites = int(preset["max_sites"])
-    if args.max_supercell_sites == 80:
+    if args.max_supercell_sites == 120:
         args.max_supercell_sites = int(preset["max_supercell_sites"])
     if args.skip_supercell and preset["include_supercell"]:
         pass
     return args, list(preset["references"])
+
+
+def apply_size_bucket_defaults(args: argparse.Namespace) -> argparse.Namespace:
+    if not args.size_bucket:
+        return args
+    bucket = CELL_SIZE_BUCKETS[args.size_bucket]
+    args.min_sites = int(bucket["min_sites"])
+    args.max_sites = None if bucket["max_sites"] is None else int(bucket["max_sites"])
+    return args
 
 
 def main() -> None:
@@ -1234,21 +1294,33 @@ def main() -> None:
         help="Formula list for automatic MP reference selection.",
     )
     parser.add_argument(
+        "--size-bucket",
+        choices=sorted(CELL_SIZE_BUCKETS),
+        default=None,
+        help="Reference-structure site-count bucket: small (<20), medium (20-50), or large (>50).",
+    )
+    parser.add_argument(
         "--material-id",
         action="append",
         default=[],
         help="Explicit MP material ID to benchmark. Repeat to pin a custom set.",
     )
-    parser.add_argument("--max-per-formula", type=int, default=2)
-    parser.add_argument("--max-total-structures", type=int, default=6)
-    parser.add_argument("--max-sites", type=int, default=40)
+    parser.add_argument("--max-per-formula", type=int, default=20)
+    parser.add_argument("--max-total-structures", type=int, default=60)
+    parser.add_argument("--min-sites", type=int, default=None)
+    parser.add_argument("--max-sites", type=int, default=None)
+    parser.add_argument(
+        "--min-reference-parents-per-formula",
+        type=int,
+        default=2,
+        help="Minimum number of reference parents a formula must retain for held-out evaluation.",
+    )
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--symprec", type=float, default=0.01)
     parser.add_argument("--coord-noise", type=float, nargs="*", default=DEFAULT_COORD_NOISE)
     parser.add_argument("--lattice-noise", type=float, nargs="*", default=DEFAULT_LATTICE_NOISE)
-    parser.add_argument("--combined-noise", type=str, nargs="*", default=DEFAULT_COMBINED_NOISE)
     parser.add_argument("--skip-supercell", action="store_true")
-    parser.add_argument("--max-supercell-sites", type=int, default=80)
+    parser.add_argument("--max-supercell-sites", type=int, default=120)
     parser.add_argument("--dmax", type=float, default=10.0)
     parser.add_argument("--nmax", type=int, default=10)
     parser.add_argument("--lmax", type=int, default=10)
@@ -1288,12 +1360,20 @@ def main() -> None:
         raise ValueError("--pnl-first-weight must be non-negative.")
 
     args, reference_specs = apply_preset_defaults(args)
+    args = apply_size_bucket_defaults(args)
     rng = np.random.default_rng(args.seed)
-    combined_noise_levels = parse_combined_noise(args.combined_noise)
+    combined_noise_values = build_combined_noise_values(args.coord_noise, args.lattice_noise)
+    combined_noise_levels = build_combined_noise_levels(args.coord_noise, args.lattice_noise)
+    progress(
+        f"Starting benchmark | source={args.source} | size_bucket={args.size_bucket} | "
+        f"coord_noise={args.coord_noise} | lattice_noise={args.lattice_noise}"
+    )
 
     if args.source == "local":
+        progress(f"Loading local dataset from {args.dataset_root}")
         references, queries = discover_local_entries(args.dataset_root, symprec=args.symprec)
     else:
+        progress("Fetching Materials Project references")
         api_key = get_mp_api_key(args.api_key)
         references = fetch_mp_references(
             api_key=api_key,
@@ -1302,9 +1382,15 @@ def main() -> None:
             reference_specs=reference_specs,
             max_per_formula=args.max_per_formula,
             max_total_structures=args.max_total_structures,
+            min_sites=args.min_sites,
             max_sites=args.max_sites,
             symprec=args.symprec,
         )
+        references = filter_formulas_with_min_parents(
+            references,
+            min_unique_parents=args.min_reference_parents_per_formula,
+        )
+        progress(f"Selected {len(references)} reference structures; generating query variants")
         queries = build_mp_queries(
             references,
             symprec=args.symprec,
@@ -1318,12 +1404,15 @@ def main() -> None:
         dataset_dir = args.output_dir / "dataset"
         save_entries_as_cifs(references, dataset_dir, split="references")
         save_entries_as_cifs(queries, dataset_dir, split="queries")
+        progress(f"Saved generated dataset under {dataset_dir}")
 
     manifest_rows = build_manifest_rows(references, queries)
     write_csv(args.output_dir / "dataset_manifest.csv", manifest_rows)
+    progress(f"Prepared dataset manifest | references={len(references)} | queries={len(queries)}")
 
     recp = RECP(dmax=args.dmax, nmax=args.nmax, lmax=args.lmax, rbasis=args.rbasis)
     all_entries = list(references) + list(queries)
+    progress("Computing reciprocal and G(d) descriptors")
     descriptors, build_times = compute_descriptors(
         all_entries,
         recp,
@@ -1335,6 +1424,7 @@ def main() -> None:
     descriptor_pair_rows_by_method: Dict[str, List[dict]] = {}
 
     for method_name, method_desc in descriptors.items():
+        progress(f"Building descriptor pair rows for {method_name}")
         processed_desc = preprocess_descriptor_map(
             method_desc,
             method=method_name,
@@ -1360,6 +1450,7 @@ def main() -> None:
             "query_mean": float(np.mean([times[e.entry_id] for e in queries])) if queries else 0.0,
         }
 
+    progress("Running StructureMatcher baselines")
     sm_pair_rows, sm_query_rows, sm_aggregate_rows = run_structure_matcher(
         references,
         queries,
@@ -1368,15 +1459,27 @@ def main() -> None:
     write_csv(args.output_dir / "structurematcher_query_summary.csv", sm_query_rows)
     write_csv(args.output_dir / "structurematcher_aggregate.csv", sm_aggregate_rows)
 
-    threshold_split_policy = build_threshold_split_policy(references, seed=args.seed)
-    threshold_prediction_rows, threshold_summary_rows = evaluate_threshold_pairwise_matching(
-        descriptor_pair_rows_by_method=descriptor_pair_rows_by_method,
-        sm_pair_rows=sm_pair_rows,
-        references=references,
-        split_policy=threshold_split_policy,
-        match_profile=args.continuous_match_profile,
-        pnl_first_weight=args.pnl_first_weight,
-    )
+    progress("Evaluating threshold-based descriptor matching against StructureMatcher")
+    threshold_prediction_rows: List[dict] = []
+    threshold_summary_rows: List[dict] = []
+    threshold_status = "ok"
+    threshold_error = None
+    threshold_split_policy = None
+    try:
+        threshold_split_policy = build_threshold_split_policy(references, seed=args.seed)
+        threshold_prediction_rows, threshold_summary_rows = evaluate_threshold_pairwise_matching(
+            descriptor_pair_rows_by_method=descriptor_pair_rows_by_method,
+            sm_pair_rows=sm_pair_rows,
+            references=references,
+            split_policy=threshold_split_policy,
+            match_profile=args.continuous_match_profile,
+            pnl_first_weight=args.pnl_first_weight,
+        )
+    except RuntimeError as exc:
+        threshold_status = "skipped"
+        threshold_error = str(exc)
+        progress(f"Skipping threshold evaluation: {threshold_error}")
+
     write_csv(args.output_dir / "pairwise_threshold_predictions.csv", threshold_prediction_rows)
     write_csv(args.output_dir / "pairwise_threshold_summary.csv", threshold_summary_rows)
 
@@ -1394,12 +1497,15 @@ def main() -> None:
             "curated_reference_labels": [spec.display_name for spec in reference_specs],
             "max_per_formula": args.max_per_formula,
             "max_total_structures": args.max_total_structures,
+            "size_bucket": args.size_bucket,
+            "min_sites": args.min_sites,
             "max_sites": args.max_sites,
+            "min_reference_parents_per_formula": args.min_reference_parents_per_formula,
         },
         "query_generation": {
             "coord_noise": args.coord_noise,
             "lattice_noise": args.lattice_noise,
-            "combined_noise": args.combined_noise,
+            "combined_noise": combined_noise_values,
             "include_supercell": not args.skip_supercell,
             "max_supercell_sites": args.max_supercell_sites,
             "seed": args.seed,
@@ -1417,6 +1523,8 @@ def main() -> None:
         },
         "descriptor_build_seconds": descriptor_build_summary,
         "threshold_pairwise": {
+            "status": threshold_status,
+            "error": threshold_error,
             "split_policy": threshold_split_policy,
             "summary_rows": threshold_summary_rows,
         },
@@ -1427,22 +1535,27 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     with summary_path.open("w") as handle:
         json.dump(summary, handle, indent=2)
+    progress(f"Wrote summary JSON to {summary_path}")
 
     print("=== Benchmark complete ===")
     print(f"Source:      {args.source}")
     print(f"Preset:      {args.preset}")
+    print(f"Size bucket: {args.size_bucket}")
     print(f"References:  {len(references)}")
     print(f"Queries:     {len(queries)}")
     print(f"Primary pool: {PRIMARY_POOL_SCOPE}")
     print(f"Continuous match profile: {args.continuous_match_profile}")
     print(f"P_nl first-component weight: {args.pnl_first_weight}")
-    print("Primary threshold benchmark:")
-    for row in threshold_summary_rows:
-        print(
-            f"  {row['method']} vs SM-{row['structurematcher_setting']}: "
-            f"tau={row['threshold']:.6g}, eval F1={row['evaluation_f1']:.4f}, "
-            f"precision={row['evaluation_precision']:.4f}, recall={row['evaluation_recall']:.4f}"
-        )
+    if threshold_status == "ok":
+        print("Primary threshold benchmark:")
+        for row in threshold_summary_rows:
+            print(
+                f"  {row['method']} vs SM-{row['structurematcher_setting']}: "
+                f"tau={row['threshold']:.6g}, eval F1={row['evaluation_f1']:.4f}, "
+                f"precision={row['evaluation_precision']:.4f}, recall={row['evaluation_recall']:.4f}"
+            )
+    else:
+        print(f"Primary threshold benchmark: skipped ({threshold_error})")
     for row in sm_aggregate_rows:
         print(
             f"StructureMatcher {row['setting']} true-parent match rate: "
