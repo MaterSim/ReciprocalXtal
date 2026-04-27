@@ -11,27 +11,38 @@ if str(ROOT) not in sys.path:
 
 from benchmark2.core import (
     DEFAULT_MATCH_PROFILE,
+    DEFAULT_MAX_AXIS_MULTIPLIER,
     DatasetBundle,
     BenchmarkEntry,
-    compute_pnl_descriptors,
     build_descriptor_pair_rows,
+    canonicalize_reference_structure,
+    choose_reference_structure_for_bucket,
+    compute_pnl_descriptors,
     evaluate_descriptor_pairwise_matching,
     load_prepared_dataset,
     make_niggli_structure,
     path_token,
     preprocess_descriptor_map,
     progress,
+    spacegroup_info,
     summarize_descriptor_runtime,
     write_csv,
     write_json,
+)
+
+CANONICALIZATION_MODES = (
+    "stored",
+    "niggli",
+    "primitive_niggli",
+    "bucketed_primitive_niggli",
 )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run the benchmark2 P_nl benchmark after canonicalizing references and "
-            "queries to their Niggli-reduced forms."
+            "Run the benchmark2 P_nl benchmark after applying a selectable "
+            "canonicalization pipeline to references and queries."
         )
     )
     parser.add_argument(
@@ -45,6 +56,24 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Directory to write results. Defaults under <dataset>/results/pnl_niggli/<tag>.",
+    )
+    parser.add_argument(
+        "--canonicalization-mode",
+        type=str,
+        default="niggli",
+        choices=CANONICALIZATION_MODES,
+        help=(
+            "Structure canonicalization pipeline to apply before descriptor generation. "
+            "Use 'bucketed_primitive_niggli' to primitive-standardize first, rebuild a "
+            "deterministic bucket-matching supercell, then Niggli-reduce."
+        ),
+    )
+    parser.add_argument("--symprec", type=float, default=0.01)
+    parser.add_argument(
+        "--max-axis-multiplier",
+        type=int,
+        default=DEFAULT_MAX_AXIS_MULTIPLIER,
+        help="Largest axis repeat to consider in bucketed primitive canonicalization.",
     )
     parser.add_argument("--dmax", type=float, default=10.0)
     parser.add_argument("--nmax", type=int, default=10)
@@ -68,6 +97,16 @@ def parse_args() -> argparse.Namespace:
         default=0.1,
         help="Weight applied to the first P_nl component before distance comparison.",
     )
+    parser.add_argument(
+        "--calibration-source",
+        type=str,
+        default="queries",
+        choices=["queries", "references"],
+        help=(
+            "Use dataset queries or reference-vs-reference pairs when fitting "
+            "the held-out distance threshold."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -76,25 +115,95 @@ def default_output_dir(dataset_dir: Path, args: argparse.Namespace) -> Path:
         f"dmax{path_token(args.dmax)}_nmax{path_token(args.nmax)}_lmax{path_token(args.lmax)}_"
         f"rbasis{path_token(args.rbasis)}_profile{path_token(args.continuous_match_profile)}_"
         f"pnlw{path_token(args.pnl_first_weight)}_norm{int(args.normalize_reciprocal)}_"
-        "canon_niggli"
+        f"calib_{path_token(args.calibration_source)}_"
+        f"canon_{path_token(args.canonicalization_mode)}"
     )
     return dataset_dir / "results" / "pnl_niggli" / tag
 
 
-def niggli_reduce_entry(entry: BenchmarkEntry) -> BenchmarkEntry:
-    reduced = make_niggli_structure(entry.structure)
-    if reduced is None:
-        raise RuntimeError(
-            f"Failed to build Niggli-reduced structure for entry {entry.entry_id}."
+def canonicalize_structure(
+    entry: BenchmarkEntry,
+    *,
+    canonicalization_mode: str,
+    symprec: float,
+    max_axis_multiplier: int,
+):
+    if canonicalization_mode == "stored":
+        return entry.structure.copy()
+
+    current = entry.structure.copy()
+    if canonicalization_mode in {"primitive_niggli", "bucketed_primitive_niggli"}:
+        current = canonicalize_reference_structure(current, symprec=symprec)
+
+    if canonicalization_mode == "bucketed_primitive_niggli":
+        bucketed, _ = choose_reference_structure_for_bucket(
+            current,
+            bucket=entry.bucket,
+            max_axis_multiplier=max_axis_multiplier,
         )
-    return replace(entry, structure=reduced, nsites=len(reduced))
+        if bucketed is None:
+            raise RuntimeError(
+                "Bucketed primitive canonicalization could not find a matching supercell "
+                f"for entry {entry.entry_id} in bucket '{entry.bucket}'."
+            )
+        current = bucketed
+
+    if canonicalization_mode in {"niggli", "primitive_niggli", "bucketed_primitive_niggli"}:
+        reduced = make_niggli_structure(current)
+        if reduced is None:
+            raise RuntimeError(
+                f"Failed to build canonicalized structure for entry {entry.entry_id} "
+                f"using mode '{canonicalization_mode}'."
+            )
+        current = reduced
+
+    return current
 
 
-def make_niggli_dataset(dataset: DatasetBundle) -> DatasetBundle:
+def canonicalize_entry(
+    entry: BenchmarkEntry,
+    *,
+    canonicalization_mode: str,
+    symprec: float,
+    max_axis_multiplier: int,
+) -> BenchmarkEntry:
+    structure = canonicalize_structure(
+        entry,
+        canonicalization_mode=canonicalization_mode,
+        symprec=symprec,
+        max_axis_multiplier=max_axis_multiplier,
+    )
+    symbol, number = spacegroup_info(structure, symprec=symprec)
+    return replace(
+        entry,
+        structure=structure,
+        nsites=len(structure),
+        spacegroup_symbol=symbol,
+        spacegroup_number=number,
+    )
+
+
+def make_canonicalized_dataset(dataset: DatasetBundle, args: argparse.Namespace) -> DatasetBundle:
     return DatasetBundle(
         dataset_dir=dataset.dataset_dir,
-        references=[niggli_reduce_entry(entry) for entry in dataset.references],
-        queries=[niggli_reduce_entry(entry) for entry in dataset.queries],
+        references=[
+            canonicalize_entry(
+                entry,
+                canonicalization_mode=args.canonicalization_mode,
+                symprec=args.symprec,
+                max_axis_multiplier=args.max_axis_multiplier,
+            )
+            for entry in dataset.references
+        ],
+        queries=[
+            canonicalize_entry(
+                entry,
+                canonicalization_mode=args.canonicalization_mode,
+                symprec=args.symprec,
+                max_axis_multiplier=args.max_axis_multiplier,
+            )
+            for entry in dataset.queries
+        ],
         threshold_split=dataset.threshold_split,
         metadata=dataset.metadata,
     )
@@ -105,10 +214,12 @@ def main() -> None:
     if args.pnl_first_weight < 0.0:
         raise ValueError("--pnl-first-weight must be non-negative.")
 
-    dataset = make_niggli_dataset(load_prepared_dataset(args.dataset_dir))
+    dataset = make_canonicalized_dataset(load_prepared_dataset(args.dataset_dir), args)
     output_dir = args.output_dir or default_output_dir(dataset.dataset_dir, args)
+    method_name = f"pnl_{args.canonicalization_mode}"
     progress(
-        f"Running Niggli-canonicalized P_nl benchmark | dataset={dataset.dataset_dir} | "
+        f"Running canonicalized P_nl benchmark | dataset={dataset.dataset_dir} | "
+        f"mode={args.canonicalization_mode} | calibration={args.calibration_source} | "
         f"profile={args.continuous_match_profile} | rbasis={args.rbasis}"
     )
 
@@ -134,21 +245,32 @@ def main() -> None:
     }
 
     pair_rows = build_descriptor_pair_rows(
-        method="pnl_niggli",
+        method=method_name,
         references=dataset.references,
         queries=dataset.queries,
         reference_descriptors=reference_descriptors,
         query_descriptors=query_descriptors,
     )
+    calibration_pair_rows = None
+    if args.calibration_source == "references":
+        calibration_pair_rows = build_descriptor_pair_rows(
+            method=method_name,
+            references=dataset.references,
+            queries=dataset.references,
+            reference_descriptors=reference_descriptors,
+            query_descriptors=reference_descriptors,
+        )
     prediction_rows, threshold_summary_rows = evaluate_descriptor_pairwise_matching(
         pair_rows=pair_rows,
         split_policy=dataset.threshold_split,
-        method="pnl_niggli",
+        method=method_name,
         match_profile=args.continuous_match_profile,
         pnl_first_weight=args.pnl_first_weight,
+        calibration_pair_rows=calibration_pair_rows,
+        calibration_source=args.calibration_source,
     )
     runtime_rows = summarize_descriptor_runtime(
-        method="pnl_niggli",
+        method=method_name,
         references=dataset.references,
         queries=dataset.queries,
         build_times=build_times,
@@ -160,9 +282,12 @@ def main() -> None:
     write_csv(output_dir / "threshold_summary.csv", threshold_summary_rows)
     write_csv(output_dir / "runtime_summary.csv", runtime_rows)
     summary = {
-        "method": "pnl_niggli",
+        "method": method_name,
         "dataset_dir": str(dataset.dataset_dir),
         "settings": {
+            "canonicalization_mode": args.canonicalization_mode,
+            "symprec": args.symprec,
+            "max_axis_multiplier": args.max_axis_multiplier,
             "dmax": args.dmax,
             "nmax": args.nmax,
             "lmax": args.lmax,
@@ -170,7 +295,7 @@ def main() -> None:
             "normalize_reciprocal": args.normalize_reciprocal,
             "continuous_match_profile": args.continuous_match_profile,
             "pnl_first_weight": args.pnl_first_weight,
-            "canonicalization": "niggli_reduced",
+            "calibration_source": args.calibration_source,
         },
         "reference_count": len(dataset.references),
         "query_count": len(dataset.queries),
@@ -180,8 +305,10 @@ def main() -> None:
     }
     write_json(output_dir / "benchmark_summary.json", summary)
 
-    print("=== Niggli-canonicalized P_nl benchmark complete ===")
+    print("=== Canonicalized P_nl benchmark complete ===")
     print(f"Dataset:    {dataset.dataset_dir}")
+    print(f"Mode:       {args.canonicalization_mode}")
+    print(f"Calibration:{args.calibration_source}")
     print(f"Output:     {output_dir.resolve()}")
     for row in threshold_summary_rows:
         print(

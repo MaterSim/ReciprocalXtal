@@ -7,10 +7,27 @@ from monty.serialization import loadfn
 from pyxtal.database.element import Element
 from pyxtal.XRD import create_index
 import torch
-from e3nn.o3 import spherical_harmonics
 import numpy as np
 from scipy.special import jv, jn_zeros
 from functools import lru_cache
+
+
+def _load_spherical_harmonics():
+    safe_globals = getattr(torch.serialization, "safe_globals", None)
+    if safe_globals is None:
+        from e3nn.o3 import spherical_harmonics as implementation
+
+        return implementation
+
+    # e3nn loads trusted constants with torch.load() during import. PyTorch 2.6
+    # defaults to weights_only=True, which requires allowlisting slice.
+    with safe_globals([slice]):
+        from e3nn.o3 import spherical_harmonics as implementation
+
+    return implementation
+
+
+spherical_harmonics = _load_spherical_harmonics()
 
 with importlib.resources.as_file(
     importlib.resources.files("pyxtal") / "database" / "atomic_scattering_params.json"

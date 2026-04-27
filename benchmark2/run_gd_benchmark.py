@@ -48,13 +48,24 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_MATCH_PROFILE,
         choices=["raw", "normalized", "shape"],
     )
+    parser.add_argument(
+        "--calibration-source",
+        type=str,
+        default="queries",
+        choices=["queries", "references"],
+        help=(
+            "Use dataset queries or reference-vs-reference pairs when fitting "
+            "the held-out distance threshold."
+        ),
+    )
     return parser.parse_args()
 
 
 def default_output_dir(dataset_dir: Path, args: argparse.Namespace) -> Path:
     tag = (
         f"dmax{path_token(args.dmax)}_gbin{path_token(args.g_bin_width)}_"
-        f"profile{path_token(args.continuous_match_profile)}"
+        f"profile{path_token(args.continuous_match_profile)}_"
+        f"calib_{path_token(args.calibration_source)}"
     )
     return dataset_dir / "results" / "gd" / tag
 
@@ -65,6 +76,7 @@ def main() -> None:
     output_dir = args.output_dir or default_output_dir(dataset.dataset_dir, args)
     progress(
         f"Running G(d) benchmark | dataset={dataset.dataset_dir} | "
+        f"calibration={args.calibration_source} | "
         f"profile={args.continuous_match_profile} | g_bin_width={args.g_bin_width}"
     )
 
@@ -93,12 +105,23 @@ def main() -> None:
         reference_descriptors=reference_descriptors,
         query_descriptors=query_descriptors,
     )
+    calibration_pair_rows = None
+    if args.calibration_source == "references":
+        calibration_pair_rows = build_descriptor_pair_rows(
+            method="gd",
+            references=dataset.references,
+            queries=dataset.references,
+            reference_descriptors=reference_descriptors,
+            query_descriptors=reference_descriptors,
+        )
     prediction_rows, threshold_summary_rows = evaluate_descriptor_pairwise_matching(
         pair_rows=pair_rows,
         split_policy=dataset.threshold_split,
         method="gd",
         match_profile=args.continuous_match_profile,
         pnl_first_weight=1.0,
+        calibration_pair_rows=calibration_pair_rows,
+        calibration_source=args.calibration_source,
     )
     runtime_rows = summarize_descriptor_runtime(
         method="gd",
@@ -119,6 +142,7 @@ def main() -> None:
             "dmax": args.dmax,
             "g_bin_width": args.g_bin_width,
             "continuous_match_profile": args.continuous_match_profile,
+            "calibration_source": args.calibration_source,
         },
         "reference_count": len(dataset.references),
         "query_count": len(dataset.queries),
@@ -130,6 +154,7 @@ def main() -> None:
 
     print("=== G(d) benchmark complete ===")
     print(f"Dataset:    {dataset.dataset_dir}")
+    print(f"Calibration:{args.calibration_source}")
     print(f"Output:     {output_dir.resolve()}")
     for row in threshold_summary_rows:
         print(

@@ -61,6 +61,16 @@ def parse_args() -> argparse.Namespace:
         default=0.1,
         help="Weight applied to the first P_nl component before distance comparison.",
     )
+    parser.add_argument(
+        "--calibration-source",
+        type=str,
+        default="queries",
+        choices=["queries", "references"],
+        help=(
+            "Use dataset queries or reference-vs-reference pairs when fitting "
+            "the held-out distance threshold."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -68,7 +78,8 @@ def default_output_dir(dataset_dir: Path, args: argparse.Namespace) -> Path:
     tag = (
         f"dmax{path_token(args.dmax)}_nmax{path_token(args.nmax)}_lmax{path_token(args.lmax)}_"
         f"rbasis{path_token(args.rbasis)}_profile{path_token(args.continuous_match_profile)}_"
-        f"pnlw{path_token(args.pnl_first_weight)}_norm{int(args.normalize_reciprocal)}"
+        f"pnlw{path_token(args.pnl_first_weight)}_norm{int(args.normalize_reciprocal)}_"
+        f"calib_{path_token(args.calibration_source)}"
     )
     return dataset_dir / "results" / "pnl" / tag
 
@@ -82,7 +93,8 @@ def main() -> None:
     output_dir = args.output_dir or default_output_dir(dataset.dataset_dir, args)
     progress(
         f"Running P_nl benchmark | dataset={dataset.dataset_dir} | "
-        f"profile={args.continuous_match_profile} | rbasis={args.rbasis}"
+        f"calibration={args.calibration_source} | profile={args.continuous_match_profile} | "
+        f"rbasis={args.rbasis}"
     )
 
     descriptors, build_times = compute_pnl_descriptors(
@@ -113,12 +125,23 @@ def main() -> None:
         reference_descriptors=reference_descriptors,
         query_descriptors=query_descriptors,
     )
+    calibration_pair_rows = None
+    if args.calibration_source == "references":
+        calibration_pair_rows = build_descriptor_pair_rows(
+            method="pnl",
+            references=dataset.references,
+            queries=dataset.references,
+            reference_descriptors=reference_descriptors,
+            query_descriptors=reference_descriptors,
+        )
     prediction_rows, threshold_summary_rows = evaluate_descriptor_pairwise_matching(
         pair_rows=pair_rows,
         split_policy=dataset.threshold_split,
         method="pnl",
         match_profile=args.continuous_match_profile,
         pnl_first_weight=args.pnl_first_weight,
+        calibration_pair_rows=calibration_pair_rows,
+        calibration_source=args.calibration_source,
     )
     runtime_rows = summarize_descriptor_runtime(
         method="pnl",
@@ -143,6 +166,7 @@ def main() -> None:
             "normalize_reciprocal": args.normalize_reciprocal,
             "continuous_match_profile": args.continuous_match_profile,
             "pnl_first_weight": args.pnl_first_weight,
+            "calibration_source": args.calibration_source,
         },
         "reference_count": len(dataset.references),
         "query_count": len(dataset.queries),
@@ -154,6 +178,7 @@ def main() -> None:
 
     print("=== P_nl benchmark complete ===")
     print(f"Dataset:    {dataset.dataset_dir}")
+    print(f"Calibration:{args.calibration_source}")
     print(f"Output:     {output_dir.resolve()}")
     for row in threshold_summary_rows:
         print(
