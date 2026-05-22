@@ -11,10 +11,16 @@
 
 set -euo pipefail
 
-PYTHON_BIN="/users/oridwan/miniconda3/envs/xtal/bin/python"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMMON_SH="${SCRIPT_DIR}/common.sh"
+if [[ ! -f "${COMMON_SH}" && -n "${SLURM_SUBMIT_DIR:-}" ]]; then
+  COMMON_SH="${SLURM_SUBMIT_DIR%/}/matcher_benchmark/scripts/common.sh"
+fi
+# shellcheck disable=SC1090
+source "${COMMON_SH}"
 
-BUCKET="large"
-dataset_dir="/users/oridwan/Github/ReciprocalXtal/matcher_benchmark/dataset/${BUCKET}"
+BUCKET="small"
+dataset_dir="${BENCHMARK2_DIR}/dataset/${BUCKET}"
 
 # Edit these defaults for direct `sbatch matcher_benchmark/scripts/run_pnl_benchmark.sh`.
 PY_ARGS=(
@@ -28,18 +34,16 @@ PY_ARGS=(
   --calibration-source queries
   --threshold-policy strict_medium_loose
   --calibration-grouping all_noise_same_parent
-
-
 )
 
-log_dir="/users/oridwan/Github/ReciprocalXtal/matcher_benchmark/logs"
+log_dir="${BENCHMARK2_DIR}/logs"
 log_file="${log_dir}/run_pnl_benchmark.log"
 
-cd /users/oridwan/Github/ReciprocalXtal
 mkdir -p "${log_dir}"
 printf "[%s] %s\n" "$(date +"%H:%M:%S")" "Log file: ${log_file}"
 start_time=$(date +%s)
-"${PYTHON_BIN}" /users/oridwan/Github/ReciprocalXtal/matcher_benchmark/run_pnl_benchmark.py "${PY_ARGS[@]}" "$@" 2>&1 | tee "${log_file}"
+cd "${REPO_ROOT}"
+python "${BENCHMARK2_DIR}/run_pnl_benchmark.py" "${PY_ARGS[@]}" "$@" 2>&1 | tee "${log_file}"
 end_time=$(date +%s)
 elapsed=$((end_time - start_time))
 printf "[%s] Total time taken: %d seconds\n" "$(date +"%H:%M:%S")" "$elapsed" | tee -a "${log_file}"
