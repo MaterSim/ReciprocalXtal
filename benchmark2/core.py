@@ -875,16 +875,40 @@ def fit_distance_threshold(
         raise RuntimeError("Cannot fit a threshold without calibration pairs.")
 
     unique_distances = np.sort(np.unique(distance_array))
-    epsilon = max(1e-12, np.finfo(float).eps * max(1.0, float(unique_distances[0])))
-    candidate_thresholds = np.concatenate(([unique_distances[0] - epsilon], unique_distances))
+    epsilon = max(1e-12, np.finfo(float).eps * max(1.0, float(unique_distances[-1])))
+    if len(unique_distances) == 1:
+        candidate_thresholds = np.array(
+            [unique_distances[0] - epsilon, unique_distances[0]],
+            dtype=float,
+        )
+    else:
+        # Evaluate thresholds in the gaps between observed calibration distances
+        # rather than directly on top of them. This preserves margin whenever
+        # positives and negatives are separable on calibration data.
+        midpoints = 0.5 * (unique_distances[:-1] + unique_distances[1:])
+        candidate_thresholds = np.concatenate(
+            (
+                [unique_distances[0] - epsilon],
+                midpoints,
+                [unique_distances[-1]],
+            )
+        )
 
     best_result: dict | None = None
-    best_key: tuple[float, float, float] | None = None
+    best_key: tuple[float, float, float, float] | None = None
 
     for threshold in candidate_thresholds:
         predictions = (distance_array <= threshold).astype(int)
         metrics = compute_binary_metrics(label_array, predictions)
-        key = (metrics["f1"], metrics["precision"], -float(threshold))
+        # When multiple thresholds tie on F1/precision/recall, prefer the more
+        # permissive threshold to retain calibration margin and reduce held-out
+        # false negatives for exact-transform queries.
+        key = (
+            metrics["f1"],
+            metrics["precision"],
+            metrics["recall"],
+            float(threshold),
+        )
         if best_key is None or key > best_key:
             best_key = key
             best_result = {
@@ -906,6 +930,28 @@ def classification_tag(label: int, prediction: int) -> str:
     if label == 0 and prediction == 0:
         return "TN"
     return "FN"
+
+
+def descriptor_threshold_group(query_variant: str) -> str:
+    variant = str(query_variant)
+    if variant in {
+        "conventional_standard",
+        "niggli_reduced",
+        "origin_shifted",
+        "permuted_sites",
+    }:
+        return "strict"
+    if variant == "combined_noise_0.002A_0.003":
+        return "medium"
+    return "loose"
+
+
+def query_noise_group(query_variant_family: str, query_variant: str) -> str:
+    variant = str(query_variant)
+    family = str(query_variant_family)
+    if family == "equivalent_transform" or variant == "combined_noise_0.000A_0.000":
+        return "no_noise"
+    return "noise"
 
 
 def summarize_split_evaluation(
@@ -1113,6 +1159,9 @@ def evaluate_descriptor_pairwise_matching(
     method: str,
     match_profile: str,
     pnl_first_weight: float,
+    calibration_pair_rows: Sequence[dict] | None = None,
+    calibration_source: str = "queries",
+    threshold_policy: str = "single",
 ) -> Tuple[List[dict], List[dict]]:
     prediction_rows: List[dict] = []
     summary_rows: List[dict] = []
@@ -1121,11 +1170,17 @@ def evaluate_descriptor_pairwise_matching(
     for row in pair_rows:
         rows_by_bucket[row["bucket"]].append(row)
 
+    calibration_rows_by_bucket: Dict[str, List[dict]] = rows_by_bucket
+    if calibration_pair_rows is not None:
+        calibration_rows_by_bucket = defaultdict(list)
+        for row in calibration_pair_rows:
+            calibration_rows_by_bucket[row["bucket"]].append(row)
+
     for bucket, bucket_rows in sorted(rows_by_bucket.items()):
         calibration_records: List[dict] = []
         evaluation_records: List[dict] = []
 
-        for pair_row in bucket_rows:
+        for pair_row in calibration_rows_by_bucket.get(bucket, []):
             split = assign_threshold_split(
                 bucket=bucket,
                 query_parent_id=pair_row["query_parent_id"],
@@ -1140,11 +1195,33 @@ def evaluate_descriptor_pairwise_matching(
                 **pair_row,
                 "split": split,
                 "match_profile": match_profile,
+                "calibration_source": calibration_source,
             }
             if split == "calibration":
                 calibration_records.append(record)
-            else:
+            elif calibration_pair_rows is None:
                 evaluation_records.append(record)
+
+        if calibration_pair_rows is not None:
+            for pair_row in bucket_rows:
+                split = assign_threshold_split(
+                    bucket=bucket,
+                    query_parent_id=pair_row["query_parent_id"],
+                    reference_parent_id=pair_row["reference_parent_id"],
+                    formula=pair_row["reference_formula"],
+                    split_policy=split_policy,
+                )
+                if split != "evaluation":
+                    continue
+
+                evaluation_records.append(
+                    {
+                        **pair_row,
+                        "split": split,
+                        "match_profile": match_profile,
+                        "calibration_source": calibration_source,
+                    }
+                )
 
         if not calibration_records:
             raise RuntimeError(
@@ -1155,62 +1232,121 @@ def evaluate_descriptor_pairwise_matching(
                 f"No evaluation pairs were available for method '{method}' in bucket '{bucket}'."
             )
 
-        fitted = fit_distance_threshold(
-            [record["distance"] for record in calibration_records],
-            [record["label"] for record in calibration_records],
-        )
-        threshold = fitted["threshold"]
-        calibration_metrics = fitted["metrics"]
-        evaluation_metrics = summarize_split_evaluation(
-            [record["distance"] for record in evaluation_records],
-            [record["label"] for record in evaluation_records],
-            threshold,
-        )
+        threshold_groups = ["single"]
+        if threshold_policy == "strict_medium_loose":
+            threshold_groups = ["strict", "medium", "loose"]
+            for record in calibration_records:
+                record["threshold_group"] = descriptor_threshold_group(record["query_variant"])
+                record["query_noise_group"] = query_noise_group(
+                    record["query_variant_family"], record["query_variant"]
+                )
+            for record in evaluation_records:
+                record["threshold_group"] = descriptor_threshold_group(record["query_variant"])
+                record["query_noise_group"] = query_noise_group(
+                    record["query_variant_family"], record["query_variant"]
+                )
+        elif threshold_policy != "single":
+            raise ValueError(f"Unsupported threshold policy: {threshold_policy}")
+        else:
+            for record in calibration_records:
+                record["threshold_group"] = "single"
+                record["query_noise_group"] = query_noise_group(
+                    record["query_variant_family"], record["query_variant"]
+                )
+            for record in evaluation_records:
+                record["threshold_group"] = "single"
+                record["query_noise_group"] = query_noise_group(
+                    record["query_variant_family"], record["query_variant"]
+                )
 
-        for record in calibration_records + evaluation_records:
-            prediction = int(record["distance"] <= threshold)
-            prediction_rows.append(
-                {
-                    **record,
-                    "pnl_first_weight": pnl_first_weight,
-                    "threshold": threshold,
-                    "predicted_match": prediction,
-                    "classification_tag": classification_tag(record["label"], prediction),
-                }
+        for threshold_group in threshold_groups:
+            group_calibration = [
+                record for record in calibration_records if record["threshold_group"] == threshold_group
+            ]
+            group_evaluation = [
+                record for record in evaluation_records if record["threshold_group"] == threshold_group
+            ]
+            if not group_calibration or not group_evaluation:
+                continue
+
+            fitted = fit_distance_threshold(
+                [record["distance"] for record in group_calibration],
+                [record["label"] for record in group_calibration],
             )
+            threshold = fitted["threshold"]
+            calibration_metrics = fitted["metrics"]
 
-        summary_rows.append(
-            {
-                "method": method,
-                "bucket": bucket,
-                "match_profile": match_profile,
-                "pnl_first_weight": pnl_first_weight,
-                "threshold": threshold,
-                "calibration_pairs": len(calibration_records),
-                "calibration_positives": calibration_metrics["positive_count"],
-                "calibration_negatives": calibration_metrics["negative_count"],
-                "calibration_precision": calibration_metrics["precision"],
-                "calibration_recall": calibration_metrics["recall"],
-                "calibration_f1": calibration_metrics["f1"],
-                "calibration_balanced_accuracy": calibration_metrics["balanced_accuracy"],
-                "calibration_roc_auc": fitted["roc_auc"],
-                "evaluation_pairs": len(evaluation_records),
-                "evaluation_positives": evaluation_metrics["positive_count"],
-                "evaluation_negatives": evaluation_metrics["negative_count"],
-                "evaluation_tp": evaluation_metrics["tp"],
-                "evaluation_fp": evaluation_metrics["fp"],
-                "evaluation_tn": evaluation_metrics["tn"],
-                "evaluation_fn": evaluation_metrics["fn"],
-                "evaluation_precision": evaluation_metrics["precision"],
-                "evaluation_recall": evaluation_metrics["recall"],
-                "evaluation_f1": evaluation_metrics["f1"],
-                "evaluation_balanced_accuracy": evaluation_metrics["balanced_accuracy"],
-                "evaluation_roc_auc": evaluation_metrics["roc_auc"],
-                "descriptor_mean_pair_runtime_seconds": float(
-                    np.mean([record["pair_runtime_seconds"] for record in evaluation_records])
-                ),
-            }
-        )
+            for record in group_calibration + group_evaluation:
+                prediction = int(record["distance"] <= threshold)
+                prediction_rows.append(
+                    {
+                        **record,
+                        "threshold_policy": threshold_policy,
+                        "threshold_group": threshold_group,
+                        "query_noise_group": record["query_noise_group"],
+                        "pnl_first_weight": pnl_first_weight,
+                        "threshold": threshold,
+                        "predicted_match": prediction,
+                        "classification_tag": classification_tag(record["label"], prediction),
+                    }
+                )
+
+            if threshold_policy == "strict_medium_loose":
+                evaluation_slices = [
+                    ("no_noise", [
+                        record for record in evaluation_records if record["query_noise_group"] == "no_noise"
+                    ]),
+                    ("noise", [
+                        record for record in evaluation_records if record["query_noise_group"] == "noise"
+                    ]),
+                ]
+            else:
+                evaluation_slices = [("all", group_evaluation)]
+
+            for evaluation_query_family, eval_slice in evaluation_slices:
+                if not eval_slice:
+                    continue
+                evaluation_metrics = summarize_split_evaluation(
+                    [record["distance"] for record in eval_slice],
+                    [record["label"] for record in eval_slice],
+                    threshold,
+                )
+                summary_rows.append(
+                    {
+                        "method": method,
+                        "bucket": bucket,
+                        "match_profile": match_profile,
+                        "threshold_policy": threshold_policy,
+                        "threshold_group": threshold_group,
+                        "evaluation_query_family": evaluation_query_family,
+                        "pnl_first_weight": pnl_first_weight,
+                        "calibration_source": calibration_source,
+                        "threshold": threshold,
+                        "calibration_pairs": len(group_calibration),
+                        "calibration_positives": calibration_metrics["positive_count"],
+                        "calibration_negatives": calibration_metrics["negative_count"],
+                        "calibration_precision": calibration_metrics["precision"],
+                        "calibration_recall": calibration_metrics["recall"],
+                        "calibration_f1": calibration_metrics["f1"],
+                        "calibration_balanced_accuracy": calibration_metrics["balanced_accuracy"],
+                        "calibration_roc_auc": fitted["roc_auc"],
+                        "evaluation_pairs": len(eval_slice),
+                        "evaluation_positives": evaluation_metrics["positive_count"],
+                        "evaluation_negatives": evaluation_metrics["negative_count"],
+                        "evaluation_tp": evaluation_metrics["tp"],
+                        "evaluation_fp": evaluation_metrics["fp"],
+                        "evaluation_tn": evaluation_metrics["tn"],
+                        "evaluation_fn": evaluation_metrics["fn"],
+                        "evaluation_precision": evaluation_metrics["precision"],
+                        "evaluation_recall": evaluation_metrics["recall"],
+                        "evaluation_f1": evaluation_metrics["f1"],
+                        "evaluation_balanced_accuracy": evaluation_metrics["balanced_accuracy"],
+                        "evaluation_roc_auc": evaluation_metrics["roc_auc"],
+                        "descriptor_mean_pair_runtime_seconds": float(
+                            np.mean([record["pair_runtime_seconds"] for record in eval_slice])
+                        ),
+                    }
+                )
 
     return prediction_rows, summary_rows
 

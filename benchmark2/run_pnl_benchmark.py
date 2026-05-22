@@ -71,6 +71,16 @@ def parse_args() -> argparse.Namespace:
             "the held-out distance threshold."
         ),
     )
+    parser.add_argument(
+        "--threshold-policy",
+        type=str,
+        default="single",
+        choices=["single", "strict_medium_loose"],
+        help=(
+            "Use one global threshold per bucket, or learn strict/medium/loose "
+            "thresholds from separate query-variant groups and evaluate them separately."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -79,7 +89,7 @@ def default_output_dir(dataset_dir: Path, args: argparse.Namespace) -> Path:
         f"dmax{path_token(args.dmax)}_nmax{path_token(args.nmax)}_lmax{path_token(args.lmax)}_"
         f"rbasis{path_token(args.rbasis)}_profile{path_token(args.continuous_match_profile)}_"
         f"pnlw{path_token(args.pnl_first_weight)}_norm{int(args.normalize_reciprocal)}_"
-        f"calib_{path_token(args.calibration_source)}"
+        f"calib_{path_token(args.calibration_source)}_thresh_{path_token(args.threshold_policy)}"
     )
     return dataset_dir / "results" / "pnl" / tag
 
@@ -94,7 +104,7 @@ def main() -> None:
     progress(
         f"Running P_nl benchmark | dataset={dataset.dataset_dir} | "
         f"calibration={args.calibration_source} | profile={args.continuous_match_profile} | "
-        f"rbasis={args.rbasis}"
+        f"rbasis={args.rbasis} | threshold_policy={args.threshold_policy}"
     )
 
     descriptors, build_times = compute_pnl_descriptors(
@@ -142,6 +152,7 @@ def main() -> None:
         pnl_first_weight=args.pnl_first_weight,
         calibration_pair_rows=calibration_pair_rows,
         calibration_source=args.calibration_source,
+        threshold_policy=args.threshold_policy,
     )
     runtime_rows = summarize_descriptor_runtime(
         method="pnl",
@@ -167,6 +178,7 @@ def main() -> None:
             "continuous_match_profile": args.continuous_match_profile,
             "pnl_first_weight": args.pnl_first_weight,
             "calibration_source": args.calibration_source,
+            "threshold_policy": args.threshold_policy,
         },
         "reference_count": len(dataset.references),
         "query_count": len(dataset.queries),
@@ -182,7 +194,8 @@ def main() -> None:
     print(f"Output:     {output_dir.resolve()}")
     for row in threshold_summary_rows:
         print(
-            f"{row['bucket']}: eval F1={row['evaluation_f1']:.4f}, "
+            f"{row['bucket']} | {row['evaluation_query_family']} | {row['threshold_group']}: "
+            f"eval F1={row['evaluation_f1']:.4f}, "
             f"precision={row['evaluation_precision']:.4f}, "
             f"recall={row['evaluation_recall']:.4f}, "
             f"threshold={row['threshold']:.6g}"

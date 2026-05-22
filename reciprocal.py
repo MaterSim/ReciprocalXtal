@@ -261,8 +261,8 @@ class RECP:
                     hkl_max[i] = index[i]
                 if hkl_min[i] > index[i]:
                     hkl_min[i] = index[i]
-        h0, k0, l0 = hkl_min
-        h1, k1, l1 = hkl_max
+        h0, k0, l0 = hkl_min*2
+        h1, k1, l1 = hkl_max*2
         h = np.arange(h0, h1 + 1)
         k = np.arange(k0, k1 + 1)
         l = np.arange(l0, l1 + 1)
@@ -504,114 +504,31 @@ class RECP:
         loss1 = torch.sum()
         return loss
 
+    def compute_pnl_from_cif(self, cif_path, norm=False):
+        """Load a CIF file and return the Pnl vector."""
+        from ase.io import read
+        atoms = read(cif_path)
+        p, rdf = self.compute(atoms, norm=norm)
+        return p
 
-
-
+    def compute_pnl_for_cifs(self, cif_paths, norm=False):
+        """Compute Pnl vectors for multiple CIF files."""
+        out = {}
+        for path in cif_paths:
+            out[path] = self.compute_pnl_from_cif(path, norm=norm)
+        return out
 
 if __name__ == "__main__":
-    from pyxtal import pyxtal
+    recp = RECP(dmax=10.0, nmax=10, lmax=10, rbasis="chebyshev")
 
-    #xtal1 = pyxtal(); xtal1.from_prototype('diamond') #; xtal.to_file('dia.cif'); print(xtal)
-    #xtal_sub = xtal1.subgroup_once(H=141, eps=0.1); print(xtal_sub)
-    #xtal2 = pyxtal(); xtal2.from_prototype('graphite')
-    #xtal3 = xtal1.copy(); xtal3.substitute({'C': 'Si'});
-    #xtal3.lattice = xtal3.lattice.scale(1.52); print(xtal3)
+    cif_files = [
+        "benchmark2/datasets_2/medium/structures/queries/medium__mp-1080826__conventional_standard__mp-1080826.cif",
+        "benchmark2/datasets_2/medium/structures/references/medium__mp-1080826__reference__mp-1080826.cif",
+        "benchmark2/datasets_2/medium/structures/references/medium__mp-1190171__reference__mp-1190171.cif",
+    ]
 
-    #recp = RECP(dmax=8.0, nmax=5, lmax=3)
-    #p1, rdf1 = recp.compute(xtal1.to_ase())
-    #p2, rdf2 = recp.compute(xtal1.to_ase()*2)
-    #p3, rdf3 = recp.compute(xtal_sub.to_ase())
-    #p4, rdf4 = recp.compute(xtal2.to_ase())
-    #p5, rdf5 = recp.compute(xtal3.to_ase())
-    import matplotlib.pyplot as plt
-    r = torch.linspace(0, 0.24, 1000).view(-1, 1)
-    bessel_basis = bessel_basis(r, nmax=5, r_cut=0.24)
-    chebyshev_basis = chebyshev_basis(r, nmax=5, r_cut=0.24)
-    plt.figure(figsize=(10, 8))
+    pnl_map = recp.compute_pnl_for_cifs(cif_files, norm=True)
 
-    # Plot Bessel basis functions
-    plt.subplot(2, 1, 1)
-    r_plot = r.view(-1).numpy()
-    for i in range(bessel_basis.shape[1]):
-        plt.plot(r_plot / r.max(), bessel_basis[:, i].numpy(), label=f'n={i}')
-    plt.title('Bessel Basis')
-    plt.xlabel(r'$d/d_{\mathrm{max}}$')
-    plt.ylabel('Basis Value')
-    plt.legend()
-
-    # Plot Chebyshev basis functions
-    plt.subplot(2, 1, 2)
-    for i in range(chebyshev_basis.shape[1]):
-        plt.plot(r_plot / r.max(), chebyshev_basis[:, i].numpy(), label=f'n={i}')
-    plt.title('Chebyshev Basis')
-    plt.xlabel(r'$d/d_{\mathrm{max}}$')
-    plt.ylabel('Basis Value')
-    plt.legend()
-
-    plt.tight_layout()
-    plt.savefig('Fig3.png', dpi=300)
-    plt.close()
-
-    # Test orthonormality of Bessel basis functions
-    print("\n=== Testing Orthonormality of Bessel Basis Functions ===")
-    print("Computing weighted inner product with weight r^2 (proper for spherical Bessel functions)\n")
-
-    # Compute r^2 weights for integration
-    r_vals = r.view(-1)
-    dr = r_vals[1] - r_vals[0]  # Grid spacing
-
-    # Combined weight: r^2 * dr
-    weights_bessel = r_vals ** 2 * dr
-
-    gram_matrix_unweighted = torch.zeros((bessel_basis.shape[1], bessel_basis.shape[1]))
-    gram_matrix_weighted = torch.zeros((bessel_basis.shape[1], bessel_basis.shape[1]))
-
-    for i in range(bessel_basis.shape[1]):
-        for j in range(bessel_basis.shape[1]):
-            # Unweighted inner product
-            gram_matrix_unweighted[i, j] = torch.sum(bessel_basis[:, i] * bessel_basis[:, j]) * dr
-            # Weighted inner product with r^2
-            gram_matrix_weighted[i, j] = torch.sum(weights_bessel * bessel_basis[:, i] * bessel_basis[:, j])
-
-    print("Gram Matrix (unweighted):")
-    print(gram_matrix_unweighted)
-    print("\nGram Matrix (weighted with r^2):")
-    print(gram_matrix_weighted)
-
-    identity = torch.eye(bessel_basis.shape[1])
-    ortho_error = torch.norm(gram_matrix_weighted - identity, p='fro')
-    max_off_diag = torch.max(torch.abs(gram_matrix_weighted - torch.diag(torch.diag(gram_matrix_weighted))))
-    print(f"\nOrthonormality error (Frobenius norm): {ortho_error.item():.6e}")
-    print(f"Max off-diagonal: {max_off_diag.item():.6e}")
-
-    # Test orthonormality of Chebyshev basis functions
-    print("\n=== Testing Orthonormality of Chebyshev Basis Functions ===")
-    print("Computing weighted inner product with Chebyshev weight w(x) = 1/sqrt(1-x^2)\n")
-
-    # Scale r to [-1, 1] for Chebyshev weight
-    x_cheb = 2 * (r_vals / 0.24) - 1
-    dx = x_cheb[1] - x_cheb[0]
-
-    # Chebyshev weight function: 1/sqrt(1-x^2), avoiding singularities
-    cheb_weight = 1.0 / torch.sqrt(torch.clamp(1 - x_cheb**2, min=1e-10))
-    weights_cheb = cheb_weight * dx
-
-    gram_matrix_cheb_unweighted = torch.zeros((chebyshev_basis.shape[1], chebyshev_basis.shape[1]))
-    gram_matrix_cheb_weighted = torch.zeros((chebyshev_basis.shape[1], chebyshev_basis.shape[1]))
-
-    for i in range(chebyshev_basis.shape[1]):
-        for j in range(chebyshev_basis.shape[1]):
-            # Unweighted inner product
-            gram_matrix_cheb_unweighted[i, j] = torch.sum(chebyshev_basis[:, i] * chebyshev_basis[:, j]) * dx
-            # Weighted inner product with Chebyshev weight
-            gram_matrix_cheb_weighted[i, j] = torch.sum(weights_cheb * chebyshev_basis[:, i] * chebyshev_basis[:, j])
-
-    print("Gram Matrix (unweighted):")
-    print(gram_matrix_cheb_unweighted)
-    print("\nGram Matrix (weighted with 1/sqrt(1-x^2)):")
-    print(gram_matrix_cheb_weighted)
-    identity = torch.eye(chebyshev_basis.shape[1])
-    ortho_error = torch.norm(gram_matrix_cheb_weighted - identity, p='fro')
-    max_off_diag = torch.max(torch.abs(gram_matrix_cheb_weighted - torch.diag(torch.diag(gram_matrix_cheb_weighted))))
-    print(f"\nOrthonormality error (Frobenius norm): {ortho_error.item():.6e}")
-    print(f"Max off-diagonal: {max_off_diag.item():.6e}")
+    for path, pnl in pnl_map.items():
+        print(f"\n{path}")
+        print(pnl)
