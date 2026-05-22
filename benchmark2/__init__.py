@@ -1,2 +1,0 @@
-"""Benchmark2 package."""
-
