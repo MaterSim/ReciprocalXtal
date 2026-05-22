@@ -1,0 +1,218 @@
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+from core import (
+    DEFAULT_MATCH_PROFILE,
+    compute_pnl_descriptors,
+    build_descriptor_pair_rows,
+    evaluate_descriptor_pairwise_matching,
+    load_prepared_dataset,
+    path_token,
+    preprocess_descriptor_map,
+    progress,
+    summarize_descriptor_runtime,
+    write_csv,
+    write_json,
+)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run the benchmark2 P_nl benchmark on a prepared dataset."
+    )
+    parser.add_argument(
+        "--dataset-dir",
+        type=Path,
+        required=True,
+        help="Prepared dataset directory containing dataset_manifest.csv and threshold_split.json.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Directory to write results. Defaults under <dataset>/results/pnl/<tag>.",
+    )
+    parser.add_argument("--dmax", type=float, default=10.0)
+    parser.add_argument("--nmax", type=int, default=10)
+    parser.add_argument("--lmax", type=int, default=10)
+    parser.add_argument(
+        "--rbasis",
+        type=str,
+        default="bessel",
+        choices=["bessel", "chebyshev", "gto"],
+    )
+    parser.add_argument("--normalize-reciprocal", action="store_true")
+    parser.add_argument(
+        "--continuous-match-profile",
+        type=str,
+        default=DEFAULT_MATCH_PROFILE,
+        choices=["raw", "normalized", "shape"],
+    )
+    parser.add_argument(
+        "--pnl-first-weight",
+        type=float,
+        default=0.1,
+        help="Weight applied to the first P_nl component before distance comparison.",
+    )
+    parser.add_argument(
+        "--calibration-source",
+        type=str,
+        default="queries",
+        choices=["queries", "references"],
+        help=(
+            "Use dataset queries or reference-vs-reference pairs when fitting "
+            "the held-out distance threshold."
+        ),
+    )
+    parser.add_argument(
+        "--threshold-policy",
+        type=str,
+        default="single",
+        choices=["single", "strict_medium_loose"],
+        help=(
+            "Use one global threshold per bucket, or learn strict/medium/loose "
+            "thresholds from separate query-variant groups and evaluate them separately."
+        ),
+    )
+    parser.add_argument(
+        "--calibration-grouping",
+        type=str,
+        default="threshold_group",
+        choices=["threshold_group", "all_noise_same_parent"],
+        help=(
+            "How to group calibration pairs when fitting thresholds. "
+            "'threshold_group' keeps the current strict/medium/loose split. "
+            "'all_noise_same_parent' treats all same-parent pairs (clean and noisy) "
+            "as positives and all wrong-parent pairs (clean and noisy) as negatives "
+            "for threshold fitting."
+        ),
+    )
+    return parser.parse_args()
+
+
+def default_output_dir(dataset_dir: Path, args: argparse.Namespace) -> Path:
+    tag = (
+        f"dmax{path_token(args.dmax)}_nmax{path_token(args.nmax)}_lmax{path_token(args.lmax)}_"
+        f"rbasis{path_token(args.rbasis)}_profile{path_token(args.continuous_match_profile)}_"
+        f"calib_{path_token(args.calibration_source)}_"
+        f"calgrp_{path_token(args.calibration_grouping)}_"
+        f"thresh_{path_token(args.threshold_policy)}"
+    )
+    return dataset_dir / "results" / "pnl" / tag
+
+
+def main() -> None:
+    args = parse_args()
+    if args.pnl_first_weight < 0.0:
+        raise ValueError("--pnl-first-weight must be non-negative.")
+
+    dataset = load_prepared_dataset(args.dataset_dir)
+    output_dir = args.output_dir or default_output_dir(dataset.dataset_dir, args)
+    progress(
+        f"Running P_nl benchmark | dataset={dataset.dataset_dir} | "
+        f"calibration={args.calibration_source} | profile={args.continuous_match_profile} | "
+        f"rbasis={args.rbasis} | threshold_policy={args.threshold_policy} | "
+        f"calibration_grouping={args.calibration_grouping}"
+    )
+
+    descriptors, build_times = compute_pnl_descriptors(
+        dataset.all_entries(),
+        dmax=args.dmax,
+        nmax=args.nmax,
+        lmax=args.lmax,
+        rbasis=args.rbasis,
+        normalize_reciprocal=False)
+    processed = preprocess_descriptor_map(
+        descriptors,
+        method="pnl",
+        match_profile=args.continuous_match_profile,
+        pnl_first_weight=args.pnl_first_weight,
+    )
+    reference_descriptors = {
+        entry.entry_id: processed[entry.entry_id] for entry in dataset.references
+    }
+    query_descriptors = {
+        entry.entry_id: processed[entry.entry_id] for entry in dataset.queries
+    }
+
+    pair_rows = build_descriptor_pair_rows(
+        method="pnl",
+        references=dataset.references,
+        queries=dataset.queries,
+        reference_descriptors=reference_descriptors,
+        query_descriptors=query_descriptors,
+    )
+    calibration_pair_rows = None
+    if args.calibration_source == "references":
+        calibration_pair_rows = build_descriptor_pair_rows(
+            method="pnl",
+            references=dataset.references,
+            queries=dataset.references,
+            reference_descriptors=reference_descriptors,
+            query_descriptors=reference_descriptors,
+        )
+    prediction_rows, threshold_summary_rows = evaluate_descriptor_pairwise_matching(
+        pair_rows=pair_rows,
+        split_policy=dataset.threshold_split,
+        method="pnl",
+        match_profile=args.continuous_match_profile,
+        pnl_first_weight=args.pnl_first_weight,
+        calibration_pair_rows=calibration_pair_rows,
+        calibration_source=args.calibration_source,
+        threshold_policy=args.threshold_policy,
+        calibration_grouping=args.calibration_grouping,
+    )
+    runtime_rows = summarize_descriptor_runtime(
+        method="pnl",
+        references=dataset.references,
+        queries=dataset.queries,
+        build_times=build_times,
+        pair_rows=pair_rows,
+    )
+
+    write_csv(output_dir / "pairwise_distances.csv", pair_rows)
+    write_csv(output_dir / "pairwise_predictions.csv", prediction_rows)
+    write_csv(output_dir / "threshold_summary.csv", threshold_summary_rows)
+    write_csv(output_dir / "runtime_summary.csv", runtime_rows)
+    summary = {
+        "method": "pnl",
+        "dataset_dir": str(dataset.dataset_dir),
+        "settings": {
+            "dmax": args.dmax,
+            "nmax": args.nmax,
+            "lmax": args.lmax,
+            "rbasis": args.rbasis,
+            "continuous_match_profile": args.continuous_match_profile,
+            "pnl_first_weight": args.pnl_first_weight,
+            "calibration_source": args.calibration_source,
+            "threshold_policy": args.threshold_policy,
+            "calibration_grouping": args.calibration_grouping,
+        },
+        "reference_count": len(dataset.references),
+        "query_count": len(dataset.queries),
+        "pair_count": len(pair_rows),
+        "threshold_summary": threshold_summary_rows,
+        "runtime_summary": runtime_rows,
+    }
+    write_json(output_dir / "benchmark_summary.json", summary)
+
+    print("=== P_nl benchmark complete ===")
+    print(f"Dataset:    {dataset.dataset_dir}")
+    print(f"Calibration:{args.calibration_source}")
+    print(f"Cal-group:  {args.calibration_grouping}")
+    print(f"Output:     {output_dir.resolve()}")
+    for row in threshold_summary_rows:
+        print(
+            f"{row['bucket']} | {row['evaluation_query_family']} | {row['threshold_group']}: "
+            f"eval F1={row['evaluation_f1']:.4f}, "
+            f"precision={row['evaluation_precision']:.4f}, "
+            f"recall={row['evaluation_recall']:.4f}, "
+            f"threshold={row['threshold']:.6g}"
+        )
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,2 @@
+method,bucket,reference_count,query_count,reference_total_seconds,query_total_seconds,reference_mean_seconds,query_mean_seconds,pair_mean_runtime_seconds
+pnl,medium,60,780,5.696735918521881,73.86814315244555,0.09494559864203135,0.09470274763134046,3.0952424575120977e-06

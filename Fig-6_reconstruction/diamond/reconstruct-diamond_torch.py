@@ -473,7 +473,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Fully differentiable inverse optimization of crystal structure using reciprocal-space descriptors"
     )
-    parser.add_argument("--prototype", type=str, default="diamond", help="Structure prototype")
+    parser.add_argument("--prototype", type=str, default="h-diamond", help="Structure prototype")
     parser.add_argument("--d-lat", type=float, default=1, help="Relative lattice perturbation")
     parser.add_argument("--d-coor", type=float, default=2, help="Coordinate perturbation magnitude (Å)")
     args = parser.parse_args()

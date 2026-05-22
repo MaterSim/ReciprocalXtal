@@ -1,0 +1,50 @@
+# generated using pymatgen
+data_TiO2
+_symmetry_space_group_name_H-M   'P 1'
+_cell_length_a   4.93095238
+_cell_length_b   5.98859224
+_cell_length_c   10.32537581
+_cell_angle_alpha   90.00000000
+_cell_angle_beta   90.00000000
+_cell_angle_gamma   90.00000000
+_symmetry_Int_Tables_number   1
+_chemical_formula_structural   TiO2
+_chemical_formula_sum   'Ti8 O16'
+_cell_volume   304.90280459
+_cell_formula_units_Z   8
+loop_
+ _symmetry_equiv_pos_site_id
+ _symmetry_equiv_pos_as_xyz
+  1  'x, y, z'
+loop_
+ _atom_site_type_symbol
+ _atom_site_label
+ _atom_site_symmetry_multiplicity
+ _atom_site_fract_x
+ _atom_site_fract_y
+ _atom_site_fract_z
+ _atom_site_occupancy
+  Ti  Ti0  1  0.50026692  0.50255558  0.23737508  1
+  Ti  Ti1  1  0.48838270  0.49240239  0.75492320  1
+  Ti  Ti2  1  0.51713223  0.99878324  0.26325727  1
+  Ti  Ti3  1  0.51058186  0.00704035  0.74652952  1
+  Ti  Ti4  1  0.99872769  0.25588958  0.24235054  1
+  Ti  Ti5  1  0.99655243  0.74452865  0.74721944  1
+  Ti  Ti6  1  0.01224053  0.75133483  0.25056842  1
+  Ti  Ti7  1  0.00131783  0.24856982  0.74918804  1
+  O  O8  1  0.82681061  0.49596948  0.15574214  1
+  O  O9  1  0.83149858  0.48484814  0.84300944  1
+  O  O10  1  0.16732186  0.00388113  0.33730365  1
+  O  O11  1  0.15826558  0.00706168  0.65433038  1
+  O  O12  1  0.17182539  0.49480770  0.33334818  1
+  O  O13  1  0.15230095  0.49534056  0.65907314  1
+  O  O14  1  0.82164176  0.01216747  0.16144383  1
+  O  O15  1  0.82504783  0.01277573  0.84308640  1
+  O  O16  1  0.65978014  0.24218653  0.34073680  1
+  O  O17  1  0.67472789  0.73851109  0.66436864  1
+  O  O18  1  0.32971482  0.75760756  0.15817696  1
+  O  O19  1  0.33848452  0.25545334  0.84784279  1
+  O  O20  1  0.32645935  0.26582175  0.15275573  1
+  O  O21  1  0.33676975  0.75633845  0.84178643  1
+  O  O22  1  0.67638962  0.73683498  0.34145645  1
+  O  O23  1  0.67751480  0.25086520  0.65359799  1

@@ -1,0 +1,29 @@
+# generated using pymatgen
+data_SiO2
+_symmetry_space_group_name_H-M   'P 1'
+_cell_length_a   3.15900104
+_cell_length_b   3.29163880
+_cell_length_c   3.25650332
+_cell_angle_alpha   57.68508137
+_cell_angle_beta   61.71567793
+_cell_angle_gamma   60.59924070
+_symmetry_Int_Tables_number   1
+_chemical_formula_structural   SiO2
+_chemical_formula_sum   'Si1 O2'
+_cell_volume   23.88191839
+_cell_formula_units_Z   1
+loop_
+ _symmetry_equiv_pos_site_id
+ _symmetry_equiv_pos_as_xyz
+  1  'x, y, z'
+loop_
+ _atom_site_type_symbol
+ _atom_site_label
+ _atom_site_symmetry_multiplicity
+ _atom_site_fract_x
+ _atom_site_fract_y
+ _atom_site_fract_z
+ _atom_site_occupancy
+  Si  Si0  1  0.00108473  0.00021019  0.99902102  1
+  O  O1  1  0.24913309  0.25062457  0.24993760  1
+  O  O2  1  0.74929638  0.75063572  0.75024028  1

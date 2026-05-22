@@ -7,8 +7,6 @@ from monty.serialization import loadfn
 from pyxtal.database.element import Element
 from pyxtal.XRD import create_index
 import torch
-import numpy as np
-from scipy.special import jv, jn_zeros
 from functools import lru_cache
 
 
@@ -19,8 +17,6 @@ def _load_spherical_harmonics():
 
         return implementation
 
-    # e3nn loads trusted constants with torch.load() during import. PyTorch 2.6
-    # defaults to weights_only=True, which requires allowlisting slice.
     with safe_globals([slice]):
         from e3nn.o3 import spherical_harmonics as implementation
 
@@ -34,8 +30,6 @@ with importlib.resources.as_file(
 ) as path:
     ATOMIC_SCATTERING_PARAMS = loadfn(path)
 
-import torch
-import numpy as np
 from scipy.special import spherical_jn
 from scipy.optimize import brentq
 
@@ -157,6 +151,8 @@ def gto_basis(r, nmax=6, r_cut=0.24):
     # Squeeze r to ensure it's 1D: (N, 1) -> (N,)
     if isinstance(r, torch.Tensor) and r.dim() > 1:
         r = r.squeeze(-1)
+    elif isinstance(r, np.ndarray) and r.ndim > 1:
+        r = r.squeeze(-1)
 
     # Scale r to [0, 1] range
     r_scaled = r / r_cut
@@ -171,7 +167,10 @@ def gto_basis(r, nmax=6, r_cut=0.24):
     for n in range(nmax):
         # GTO-like function: r^n * exp(-alpha * r^2)
         alpha = 1.0 / (n + 1)  # Different width for each basis function
-        basis[:, n] = ((r_scaled ** n) * torch.exp(-alpha * r_scaled ** 2)).view(-1)
+        if isinstance(r, torch.Tensor):
+            basis[:, n] = ((r_scaled ** n) * torch.exp(-alpha * r_scaled ** 2)).view(-1)
+        else:
+            basis[:, n] = (r_scaled ** n) * np.exp(-alpha * r_scaled ** 2)
 
     return basis  # Shape (N, nmax)
 
@@ -180,35 +179,52 @@ def chebyshev_basis(r, nmax=6, r_cut=0.24, normalize=True):
     Chebyshev polynomial basis - excellent for oscillatory features
     """
     # Squeeze r to ensure it's 1D: (N, 1) -> (N,)
-    if r.dim() > 1:
-        r = r.squeeze(-1)
+    if isinstance(r, torch.Tensor):
+        if r.dim() > 1:
+            r = r.squeeze(-1)
+        is_torch = True
+    else:
+        if r.ndim > 1:
+            r = r.squeeze(-1)
+        is_torch = False
 
     # Scale r to [-1, 1] range for Chebyshev polynomials
     r_scaled = 2 * (r / r_cut) - 1
-    basis = torch.zeros((r.shape[0], nmax), dtype=r.dtype, device=r.device)
+    if is_torch:
+        basis = torch.zeros((r.shape[0], nmax), dtype=r.dtype, device=r.device)
+    else:
+        basis = np.zeros((r.shape[0], nmax), dtype=r.dtype if hasattr(r, "dtype") else np.float64)
 
     # T0(x) = 1, T1(x) = x
     basis[:, 0] = 1
     if nmax > 1:
-        basis[:, 1] = r_scaled.view(-1)
+        basis[:, 1] = r_scaled.reshape(-1)
 
     # Recurrence relation: Tn+1(x) = 2x*Tn(x) - Tn-1(x)
     for n in range(2, nmax):
-        basis[:, n] = 2 * r_scaled.view(-1) * basis[:, n-1] - basis[:, n-2]
+        basis[:, n] = 2 * r_scaled.reshape(-1) * basis[:, n-1] - basis[:, n-2]
 
     # Normalize each basis function with Chebyshev weight
     if normalize:
-        x_vals = r_scaled.view(-1)
+        x_vals = r_scaled.reshape(-1)
         dx = x_vals[1] - x_vals[0] if len(x_vals) > 1 else 1.0
         # Chebyshev weight: 1/sqrt(1-x^2), avoiding singularities
-        weights = 1.0 / torch.sqrt(torch.clamp(1 - x_vals**2, min=1e-10))
+        if is_torch:
+            weights = 1.0 / torch.sqrt(torch.clamp(1 - x_vals**2, min=1e-10))
+        else:
+            weights = 1.0 / np.sqrt(np.clip(1 - x_vals**2, 1e-10, None))
         weights = weights * dx
 
         for n in range(nmax):
             # Compute norm with Chebyshev weight
-            norm_sq = torch.sum(weights * basis[:, n] ** 2)
-            if norm_sq > 1e-10:
-                basis[:, n] /= torch.sqrt(norm_sq)
+            if is_torch:
+                norm_sq = torch.sum(weights * basis[:, n] ** 2)
+                if norm_sq > 1e-10:
+                    basis[:, n] /= torch.sqrt(norm_sq)
+            else:
+                norm_sq = np.sum(weights * basis[:, n] ** 2)
+                if norm_sq > 1e-10:
+                    basis[:, n] /= np.sqrt(norm_sq)
 
     return basis
 
@@ -220,7 +236,6 @@ class RECP:
         d_max (float): maximum d-spacing to consider in the reciprocal space
         nmax: int, degree of radial expansion
         lmax: int, degree of spherical harmonic expansion
-        alpha: float, gaussian width parameter
     """
 
     def __init__(self, dmax=6.0, nmax=4, lmax=4, rbasis='chebyshev', res=0.1, sigma=None):
@@ -233,10 +248,14 @@ class RECP:
         self.sigma = sigma
         self.rbasis = rbasis
         self.rcut = 0.5 * self.dmax / np.pi
+        self.msize = 2 * self.lmax + 1
+        self.l_vals = np.repeat(np.arange(self.lmax + 1), [2 * l + 1 for l in range(self.lmax + 1)])
+        self.m_vals = np.concatenate([np.arange(-l, l + 1) for l in range(self.lmax + 1)])
+        self.midx_vals = self.msize // 2 + self.m_vals
 
     def __str__(self):
-        s = "Reciprocal space expansion with Cutoff: {self.dmax:6.3f} per Ang\n"
-        s += "lmax: {self.lmax}, nmax: {self.nmax}, alpha: {self.alpha:.3f}\n"
+        s = f"Reciprocal space expansion with cutoff: {self.dmax:6.3f} per Ang\n"
+        s += f"lmax: {self.lmax}, nmax: {self.nmax}, rbasis: {self.rbasis}\n"
         return s
 
     def __repr__(self):
@@ -281,9 +300,14 @@ class RECP:
         # Compute the atomic scattering factors
         coeffs = np.zeros([N_atoms, 4, 2])
         zs = np.zeros([N_atoms, 1], dtype=int)
+        element_cache = {
+            elem: (ATOMIC_SCATTERING_PARAMS[elem], Element(elem).z)
+            for elem in set(atoms.get_chemical_symbols())
+        }
         for i, elem in enumerate(atoms.get_chemical_symbols()):
-            coeffs[i, :, :] = ATOMIC_SCATTERING_PARAMS[elem]
-            zs[i] = Element(elem).z
+            coeff, z = element_cache[elem]
+            coeffs[i, :, :] = coeff
+            zs[i] = z
 
         tmp1 = np.exp(np.einsum("ij,k->ijk", -coeffs[:, :, 1], s2))  # N*4, M
         tmp2 = np.einsum("ij,ijk->ik", coeffs[:, :, 0], tmp1)  # N*4, N*M
@@ -303,6 +327,11 @@ class RECP:
         I0 = np.sum(zs)**2
         intensities /= I0  # Normalize the intensities
         intensities *= np.cos(0.5 * np.pi * d_hkl / self.dmax)  # Apply the Gaussian factor
+        # Remove peaks that survive the raw structure-factor threshold but become
+        # numerically negligible after normalization and tapering near dmax.
+        post_eps = max(1e-8 * float(np.max(intensities)), 1e-12)
+        post_mask = intensities > post_eps
+        hkl, intensities, d_hkl = hkl[post_mask], intensities[post_mask], d_hkl[post_mask]
         #print("intensities", intensities.shape, intensities.min(), intensities.max())
         #max_idx = np.argmax(intensities); print("max", intensities[max_idx], hkl[max_idx], d_hkl[max_idx], fs[max_idx])
         #min_idx = np.argmin(intensities); print("min", intensities[min_idx], hkl[min_idx], d_hkl[min_idx], fs[min_idx])
@@ -338,9 +367,54 @@ class RECP:
         #print("rdf shape:", rdf.shape, "rdf min:", rdf.min(), "rdf max:", rdf.max())
         return rdf
 
+    def build_radial_grid(self, r_values=None, intensities=None):
+        """
+        Build a single representative radial shell in the same units as
+        |q| = ||xyz||.
+
+        The active formulation intentionally uses one shell centered at the
+        intensity-weighted mean reciprocal radius.
+        """
+        if r_values is None or intensities is None or len(r_values) == 0:
+            r_center = 0.5 * self.rcut
+        else:
+            r_values = np.asarray(r_values, dtype=np.float64).reshape(-1)
+            intensities = np.asarray(intensities, dtype=np.float64).reshape(-1)
+            weight_sum = np.sum(intensities)
+            if abs(weight_sum) < 1e-12:
+                r_center = np.mean(r_values)
+            else:
+                r_center = np.sum(r_values * intensities) / weight_sum
+            r_center = np.clip(r_center, 0.0, self.rcut)
+
+        return np.asarray([r_center], dtype=np.float64)
+
+    def radial_basis_on_grid(self, r_grid):
+        """
+        Evaluate the selected radial basis on the representative shell.
+        """
+        r_input = np.asarray(r_grid, dtype=np.float64).reshape(-1, 1)
+        if self.rbasis == 'chebyshev':
+            return chebyshev_basis(r_input, self.nmax, self.rcut)
+        elif self.rbasis == 'gto':
+            return gto_basis(r_input, self.nmax, self.rcut)
+        return bessel_basis(r_input, self.nmax, self.rcut)
+
     def compute_sph_torch(self, xyz, v, norm=False):
         """
-        Compute a descriptor using spherical harmonics and radial basis functions.
+        Compute a reciprocal-space descriptor using the paper-style angular
+        projection, while collapsing the radial dependence to one
+        representative shell.
+
+        The active approximation is:
+
+            a_lm = sum_i I_i Y_lm^*(qhat_i)
+            A_nlm = R_n(d_shell) a_lm
+            P_nl = sum_m |A_nlm|^2
+
+        where d_shell is one representative reciprocal radius for the
+        structure. This intentionally ignores shell-to-shell radial
+        integration and keeps only one shell.
 
         Args:
             xyz: Tensor of shape (N, 3) representing 3D coordinates.
@@ -348,74 +422,54 @@ class RECP:
             norm: Whether to normalize the final descriptor.
 
         Returns:
-            Tensor of shape (sum(2l+1) * nmax,) representing the descriptor.
+            Array of shape
+            (nmax * (lmax + 1),)
+            representing the one-shell diagonal P_{nl} descriptor.
         """
-        # Convert NumPy arrays to PyTorch tensors and force expected shapes
-        xyz = torch.tensor(xyz, dtype=torch.float32)
-        xyz = xyz.reshape(-1, 3)  # (N, 3)
+        xyz = np.asarray(xyz, dtype=np.float64).reshape(-1, 3)
+        if xyz.shape[0] == 0:
+            return np.zeros(self.nmax * (self.lmax + 1), dtype=np.float32)
 
-        v = torch.tensor(v, dtype=torch.float32)
-        v = v.reshape(-1, 1)  # (N, 1)
+        intensities = np.asarray(v, dtype=np.float64).reshape(-1)
+        radii = np.linalg.norm(xyz, axis=1)
+        safe_r = np.where(radii > 1e-12, radii, 1e-12)
 
-        r = torch.norm(xyz, dim=1, keepdim=True)  # (N, 1)
-        r_hat = xyz / (r + 1e-12)  # (N, 3) unit direction
-        #print("Debug xyz", xyz.shape, "r_hat", r_hat, "r", r)
+        # 1. Choose one representative shell radius and evaluate the selected
+        # radial basis on that shell.
+        r_grid = self.build_radial_grid(radii, intensities)
+        radial_basis = np.asarray(self.radial_basis_on_grid(r_grid), dtype=np.float64).reshape(-1)
 
-        # Compute spherical harmonics up to lmax
-        if self.rbasis == 'chebyshev':
-            R = chebyshev_basis(r, self.nmax, self.rcut)
-        elif self.rbasis == 'gto':
-            R = gto_basis(r, self.nmax, self.rcut)
-        else:
-            R = bessel_basis(r, self.nmax, self.rcut)
-        #print("Debug Radial", R)
+        # 2. Real spherical harmonics evaluated directly at reciprocal peak
+        # directions using the faster e3nn implementation.
+        rhat_t = torch.tensor(xyz / safe_r[:, None], dtype=torch.float32)
+        degrees = list(range(self.lmax + 1))
+        Y = spherical_harmonics(
+            degrees,
+            rhat_t,
+            normalize=False,
+            normalization="norm",
+        ).detach().cpu().numpy()
 
-        degrees = list(range(0, self.lmax + 1))
-        #degrees = list(range(0, self.lmax + 1, 2))
-        Y = spherical_harmonics(degrees, r_hat, normalize=False, normalization='norm')#component')
-        # Ensure Y is 2D (N, sum(2l+1)) for broadcasting with (N, 1)
-        Y = Y.reshape(Y.shape[0], -1)
-
-        # Sanity checks for consistent point dimension
-        if R.shape[0] != Y.shape[0] or v.shape[0] != Y.shape[0]:
-            raise ValueError(
-                f"Shape mismatch: R={tuple(R.shape)}, Y={tuple(Y.shape)}, v={tuple(v.shape)}. "
-                "All must share the same first dimension N (number of reciprocal points)."
+        # 3. One-shell angular coefficients a_lm and one-shell radial weighting.
+        a_lm = np.zeros((self.lmax + 1, self.msize), dtype=np.float64)
+        offset = 0
+        weighted_Y = intensities[:, None] * Y
+        for l in range(self.lmax + 1):
+            dim = 2 * l + 1
+            a_lm[l, self.msize // 2 - l : self.msize // 2 + l + 1] = np.sum(
+                weighted_Y[:, offset : offset + dim],
+                axis=0,
             )
-        #print("Debug Spherical", Y.shape, "Y min:", Y.min(), "Y max:", Y.max())
+            offset += dim
 
-        descriptor = []
-        # For each radial basis function
-        for n in range(self.nmax):
-            r_basis = R[:, n:n+1]  # Shape (N, 1)
-
-            # Weight the spherical harmonics by this radial basis
-            # Expand r_basis to match Y's shape: (N, 1) -> (N, 1), then broadcast with (N, sum(2l+1))
-            weight = (v * r_basis)  # Shape (N, 1)
-            f_n = weight * Y  # Shape (N, sum(2l+1)) via broadcasting
-
-            # Process by angular momentum
-            offset = 0
-            for l in degrees:
-                #print(f"\nDebug l={l}, n={n}, offset={offset}")
-                dim = 2 * l + 1
-                Y_l = f_n[:, offset:offset + dim]
-                c_nl = torch.sum(Y_l, dim=0)  # Weighted sum over all points
-                power_l = torch.mean(c_nl ** 2)
-                #print(f"\nDebug Y_l at basis {n}, l={l}")
-                #print("point 0", Y_l[0, :], (Y_l[0, :]**2).sum())
-                #print("point 1", Y_l[1, :], (Y_l[1, :]**2).sum())
-                #print("point 2", Y_l[2, :], (Y_l[2, :]**2).sum())
-                #print("Total power:", power_l.item())
-
-                descriptor.append(power_l)
-                offset += dim
-        descriptor = torch.stack(descriptor)
+        # 4. Build one-shell A_nlm and keep only the diagonal power
+        #    P_nl = sum_m |A_nlm|^2.
+        A = radial_basis[:, None, None] * a_lm[None, :, :]
+        P = np.sum(np.abs(A) ** 2, axis=2).real
+        descriptor = P.reshape(-1).astype(np.float32)
         if norm:
-            norm = torch.linalg.norm(descriptor)
-            #cap descriptor at 10
-            descriptor = torch.clamp(descriptor, max=1.0)
-            descriptor /= (norm + 1e-9)  # Add epsilon for stability
+            descriptor_norm = float(np.linalg.norm(descriptor))
+            descriptor /= (descriptor_norm + 1e-9)
         return descriptor
 
     def plot(self, data, filename='reciprocal.png'):
@@ -519,7 +573,12 @@ class RECP:
         return out
 
 if __name__ == "__main__":
-    recp = RECP(dmax=10.0, nmax=10, lmax=10, rbasis="chebyshev")
+    import matplotlib.pyplot as plt
+    from pathlib import Path
+
+    import time
+
+    recp = RECP(dmax=10.0, nmax=10, lmax=10, rbasis="bessel")
 
     cif_files = [
         "benchmark2/datasets_2/medium/structures/queries/medium__mp-1080826__conventional_standard__mp-1080826.cif",
@@ -527,8 +586,58 @@ if __name__ == "__main__":
         "benchmark2/datasets_2/medium/structures/references/medium__mp-1190171__reference__mp-1190171.cif",
     ]
 
-    pnl_map = recp.compute_pnl_for_cifs(cif_files, norm=True)
+    t0 = time.time()
+    pnl_map = recp.compute_pnl_for_cifs(cif_files, norm=False)
+    t1 = time.time()
+    print(f"\nComputed PnL for {len(cif_files)} CIFs in {t1-t0:.3f} s")
+
+    # calculate distance between the first two and the last one
+    d0 = time.time()
+    dist_1 = np.linalg.norm(pnl_map[cif_files[0]] - pnl_map[cif_files[1]])
+    #L1 distance
+    #dist_1 = torch.sum(torch.abs(pnl_map[cif_files[0]] - pnl_map[cif_files[1]]))
+    dist_2 = np.linalg.norm(pnl_map[cif_files[0]] - pnl_map[cif_files[2]])
+    #dist_2 = torch.sum(torch.abs(pnl_map[cif_files[0]] - pnl_map[cif_files[2]]))
+    d1 = time.time()
+    print(f"Distance calc time: {d1-d0:.3f} s")
+    print(f"\nDistance between query and correct reference: {dist_1:.4f}")
+    print(f"Distance between query and wrong reference: {dist_2:.4f}")
 
     for path, pnl in pnl_map.items():
         print(f"\n{path}")
         print(pnl)
+
+    labels = [
+        "Query: conventional_standard",
+        "Reference: mp-1080826",
+        "Wrong reference: mp-1190171",
+    ]
+
+    plt.rcParams.update(
+        {
+            "font.size": 11,
+            "axes.labelsize": 12,
+            "axes.titlesize": 11,
+            "figure.dpi": 300,
+            "axes.facecolor": "white",
+            "figure.facecolor": "white",
+        }
+    )
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.6), sharey=True)
+    for ax, path, label in zip(axes, cif_files, labels):
+        pnl = np.asarray(pnl_map[path], dtype=float)
+        ax.plot(pnl, linewidth=1.6)
+        ax.set_title(label)
+        ax.set_xlabel("Power Spectrum Index")
+        ax.set_yscale("symlog", linthresh=1e-6)
+        ax.grid(True, alpha=0.2)
+
+    axes[0].set_ylabel(r"$P_{nl}$")
+    fig.suptitle("Three-way $P_{nl}$ comparison", fontsize=12, y=0.98)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+
+    output_path = Path("reciprocal_three_way_power_spectrum_new.png")
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"\nSaved plot: {output_path}")

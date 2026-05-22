@@ -1,0 +1,93 @@
+{
+  "seed": 7,
+  "by_bucket": {
+    "small": {
+      "calibration_parent_ids_by_formula": {
+        "C": [
+          "mp-1008374",
+          "mp-1018088",
+          "mp-1056957",
+          "mp-1078845",
+          "mp-1095534",
+          "mp-1097832",
+          "mp-1182029",
+          "mp-2049878",
+          "mp-24",
+          "mp-2516584"
+        ],
+        "SiO2": [
+          "mp-1021503",
+          "mp-1071820",
+          "mp-10851",
+          "mp-1179454",
+          "mp-1179529",
+          "mp-1188220",
+          "mp-1265115",
+          "mp-1353259",
+          "mp-16964",
+          "mp-18280"
+        ],
+        "TiO2": [
+          "mp-1079207",
+          "mp-1101022",
+          "mp-1102255",
+          "mp-1341203",
+          "mp-1380335",
+          "mp-1408285",
+          "mp-1439",
+          "mp-1445035",
+          "mp-1840",
+          "mp-2420244"
+        ]
+      },
+      "evaluation_parent_ids_by_formula": {
+        "C": [
+          "mp-1008395",
+          "mp-1040425",
+          "mp-1080826",
+          "mp-1095633",
+          "mp-1181996",
+          "mp-1188817",
+          "mp-1190171",
+          "mp-1192619",
+          "mp-1205417",
+          "mp-169"
+        ],
+        "SiO2": [
+          "mp-10064",
+          "mp-10948",
+          "mp-11684",
+          "mp-1179447",
+          "mp-12350",
+          "mp-12787",
+          "mp-1398433",
+          "mp-17909",
+          "mp-32667",
+          "mp-545488"
+        ],
+        "TiO2": [
+          "mp-1008677",
+          "mp-1041565",
+          "mp-1044853",
+          "mp-1102591",
+          "mp-1190753",
+          "mp-1386640",
+          "mp-1400963",
+          "mp-1426806",
+          "mp-25262",
+          "mp-25433"
+        ]
+      },
+      "mode_by_formula": {
+        "C": "held_out_query_parents_with_reference_quarantine",
+        "SiO2": "held_out_query_parents_with_reference_quarantine",
+        "TiO2": "held_out_query_parents_with_reference_quarantine"
+      },
+      "fallback_reason_by_formula": {
+        "C": null,
+        "SiO2": null,
+        "TiO2": null
+      }
+    }
+  }
+}

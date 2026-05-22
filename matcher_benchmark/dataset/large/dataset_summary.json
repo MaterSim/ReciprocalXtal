@@ -1,0 +1,72 @@
+{
+  "bucket": "large",
+  "reference_count": 60,
+  "query_count": 780,
+  "selection": {
+    "formulas": [
+      "C",
+      "SiO2",
+      "TiO2"
+    ],
+    "material_ids": [],
+    "max_per_formula": 20,
+    "max_total_structures": 60,
+    "min_reference_parents_per_formula": 2,
+    "max_axis_multiplier": 6
+  },
+  "query_generation": {
+    "coord_noise_levels_angstrom": [
+      0.002,
+      0.015,
+      0.05
+    ],
+    "lattice_noise_levels_epsilon": [
+      0.003,
+      0.01,
+      0.03
+    ],
+    "paired_noise_levels": [
+      {
+        "coord_noise_angstrom": 0.002,
+        "lattice_noise_epsilon": 0.003
+      },
+      {
+        "coord_noise_angstrom": 0.015,
+        "lattice_noise_epsilon": 0.003
+      },
+      {
+        "coord_noise_angstrom": 0.05,
+        "lattice_noise_epsilon": 0.003
+      },
+      {
+        "coord_noise_angstrom": 0.002,
+        "lattice_noise_epsilon": 0.01
+      },
+      {
+        "coord_noise_angstrom": 0.015,
+        "lattice_noise_epsilon": 0.01
+      },
+      {
+        "coord_noise_angstrom": 0.05,
+        "lattice_noise_epsilon": 0.01
+      },
+      {
+        "coord_noise_angstrom": 0.002,
+        "lattice_noise_epsilon": 0.03
+      },
+      {
+        "coord_noise_angstrom": 0.015,
+        "lattice_noise_epsilon": 0.03
+      },
+      {
+        "coord_noise_angstrom": 0.05,
+        "lattice_noise_epsilon": 0.03
+      }
+    ],
+    "seed": 7,
+    "variant_families": [
+      "equivalent_transform",
+      "combined_perturbation"
+    ]
+  }
+}

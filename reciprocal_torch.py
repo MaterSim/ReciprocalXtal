@@ -374,7 +374,9 @@ class RECP:
             tmp = torch.sum(coeff[:, 0][None, :] * tmp, dim=1)
             sf_z = -41.78214 * tmp * s2 + float(z_int)
             atom_mask = numbers_long == z
-            sfs[atom_mask] = sf_z[None, :]
+            atom_indices = torch.nonzero(atom_mask, as_tuple=False).flatten()
+            if atom_indices.numel() > 0:
+                sfs[atom_indices, :] = sf_z.unsqueeze(0).expand(atom_indices.numel(), -1)
 
         const = torch.tensor(-2j * np.pi, dtype=torch.complex128, device=device)
         g_dot_rs = frac @ hkl.transpose(0, 1)
