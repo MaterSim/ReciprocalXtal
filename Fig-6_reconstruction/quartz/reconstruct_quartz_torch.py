@@ -158,12 +158,14 @@ class InverseOptimizer:
         pair_weights=None,
         lr=3e-2,
         steps=800,
+        seed=42,
         device=None,
     ):
         self.ref_xtal = deepcopy(reference_xtal)
         self.spg = int(reference_xtal.group.number)
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = torch.float64
+        self.seed = int(seed)
 
         self.lattice_norm_factor = 35.0
         self.angle_norm_factor = 180.0
@@ -403,9 +405,14 @@ class InverseOptimizer:
 
     def perturb_structure(self, d_lat=0.5, d_coor=0.5):
         xtal_pert = deepcopy(self.ref_xtal)
-        if hasattr(xtal_pert, "random_state") and hasattr(xtal_pert.lattice, "random_state"):
-            xtal_pert.lattice.random_state = xtal_pert.random_state.spawn(1)[0]
-        xtal_pert.apply_perturbation(d_lat=d_lat, d_coor=d_coor)
+        if hasattr(xtal_pert, "lattice") and hasattr(xtal_pert.lattice, "random_state"):
+            xtal_pert.lattice.random_state = np.random.default_rng(self.seed)
+        np_state = np.random.get_state()
+        try:
+            np.random.seed(self.seed)
+            xtal_pert.apply_perturbation(d_lat=d_lat, d_coor=d_coor)
+        finally:
+            np.random.set_state(np_state)
         rep0 = self._normalize_1d_rep(xtal_pert.get_1d_rep_x())
         return xtal_pert, rep0, d_lat, d_coor
 
@@ -430,14 +437,14 @@ def normalize_excluding_first(p, clip=None, eps=1e-12):
     return p / scale
 
 
-def main(prototype="a-quartz", d_lat=0.5, d_coor=0.5):
-    set_global_seed(42)
+def main(prototype="a-quartz", d_lat=0.5, d_coor=0.5, seed=42):
+    set_global_seed(seed)
 
     print("=" * 70)
     print(f"RECIPROCAL-SPACE INVERSE OPTIMIZATION ({prototype})")
     print("=" * 70)
 
-    xtal_ref = pyxtal(random_state=42)
+    xtal_ref = pyxtal(random_state=seed)
     xtal_ref.from_prototype(prototype)
 
     recp_params = {"dmax": 10.0, "nmax": 10, "lmax": 10, "rbasis": "bessel", "rcut": 2.1, "rdf_bins": 50, "rdf_sigma": 0.08}
@@ -449,6 +456,7 @@ def main(prototype="a-quartz", d_lat=0.5, d_coor=0.5):
         pair_weights={"Si-Si": 1.0, "Si-O": 1.0, "O-O": 1.0, "O-Si": 1.0},
         lr=3e-2,
         steps=4000,
+        seed=seed,
     )
 
     print("\n" + "-" * 70)
@@ -583,4 +591,4 @@ if __name__ == "__main__":
     parser.add_argument("--d-coor", type=float, default=2, help="Coordinate perturbation magnitude (Å)")
     args = parser.parse_args()
 
-    main(prototype=args.prototype, d_lat=args.d_lat, d_coor=args.d_coor)
+    main(prototype=args.prototype, d_lat=args.d_lat, d_coor=args.d_coor, seed=20)
